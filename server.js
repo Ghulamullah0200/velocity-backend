@@ -87,12 +87,21 @@ const processCycle = async () => {
 // --- ROUTES ---
 app.post('/api/register', async (req, res) => {
     try {
-        const { username, password } = req.body;
+        const { username, password, paymentScreenshot } = req.body;
         if (await User.findOne({ username })) return res.status(400).json({ message: 'Exists' });
-        const user = new User({ username, password });
+
+        const user = new User({
+            username,
+            password,
+            paymentScreenshot: paymentScreenshot || null,
+            status: 'Pending Verification'
+        });
         await user.save();
-        res.status(201).json({ message: 'Registered' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.status(201).json({ message: 'Registered successfully! Please wait for admin approval.' });
+    } catch (err) {
+        console.error('Register error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -156,11 +165,30 @@ app.post('/api/admin/terminate', async (req, res) => {
     res.json({ message: 'User terminated' });
 });
 
+// Admin: Get all users
+app.get('/api/admin/users', async (req, res) => {
+    try {
+        const users = await User.find({ status: { $ne: 'Admin' } }).sort({ createdAt: -1 });
+        res.json(users);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Admin verification
 app.post('/api/admin/verify', async (req, res) => {
-    const { userId } = req.body;
-    await User.findByIdAndUpdate(userId, { status: 'Verified' });
-    res.json({ message: 'Verified' });
+    try {
+        const { userId } = req.body;
+        await User.findByIdAndUpdate(userId, { status: 'Verified' });
+        res.json({ message: 'Verified' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// User: Get status
+app.get('/api/user/:id', async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ message: 'Not found' });
+        res.json({ status: user.status, balance: user.balance, rank: user.rank });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 io.on('connection', (socket) => {
