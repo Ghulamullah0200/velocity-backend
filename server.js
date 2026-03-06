@@ -11,20 +11,39 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    transports: ["websocket", "polling"]
 });
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// MongoDB connection
-mongoose.connect(process.env.MONGODB_URI)
-    .then(() => console.log('Connected to MongoDB Atlas'))
-    .catch(err => console.error('MongoDB error:', err));
+// Health check route
+app.get('/api/health', (req, res) => res.json({ status: 'Engine Running', time: new Date() }));
 
 const User = require('./models/User');
 const Transaction = require('./models/Transaction');
 const Settings = require('./models/Settings');
+const Entry = require('./models/Entry');
+
+// MongoDB connection with Robust Startup
+mongoose.connect(process.env.MONGODB_URI)
+    .then(async () => {
+        console.log('Connected to MongoDB Atlas');
+        try {
+            await initSettings();
+            await initAdmin();
+            await syncQueue();
+        } catch (err) {
+            console.error('Initialization error:', err);
+        }
+    })
+    .catch(err => console.error('MongoDB error:', err));
 
 // Initialize Settings if not exists
 const initSettings = async () => {
@@ -34,25 +53,43 @@ const initSettings = async () => {
     }
 };
 
-// Initialize Admin if not exists
+// Initialize Admin if not exists or reset credentials
 const initAdmin = async () => {
-    const admin = await User.findOne({ status: 'Admin' });
+    let admin = await User.findOne({ status: 'Admin' });
     if (!admin) {
-        const newAdmin = new User({
-            username: 'admin',
-            password: 'password123',
+        admin = new User({
+            username: 'local',
+            password: 'local12',
             status: 'Admin'
         });
-        await newAdmin.save();
-        console.log('Default admin created: admin / password123');
+        await admin.save();
+        console.log('Admin created: local / local12');
+    } else {
+        admin.username = 'local';
+        admin.password = 'local12';
+        await admin.save();
+        console.log('Admin credentials updated: local / local12');
     }
 };
 
-initSettings();
-initAdmin();
+// Sync Active Queue from Database on Startup
+const syncQueue = async () => {
+    try {
+        const activeEntries = await Entry.find({ status: 'active' }).sort({ position: 1 });
+        activeQueue = activeEntries.map(e => e._id.toString());
+        console.log(`Queue synced: ${activeQueue.length} entries`);
+
+        // If queue was full, restart cycle
+        if (activeQueue.length >= 21) {
+            startCycle();
+        }
+    } catch (err) {
+        console.error('Queue sync error:', err);
+    }
+};
 
 // --- QUEUE LOGIC ---
-let activeQueue = []; // List of user IDs
+let activeQueue = []; // List of Entry IDs (strings)
 let queueTimer = 30;
 let timerRunning = false;
 
@@ -74,11 +111,24 @@ const startCycle = () => {
 
 const processCycle = async () => {
     if (activeQueue.length === 0) return;
-    const winnerId = activeQueue.shift();
-    await User.findByIdAndUpdate(winnerId, { rank: 0, isWithdrawEligible: true, status: 'Withdraw Available' });
 
+    const entryId = activeQueue.shift();
+    const winningEntry = await Entry.findById(entryId);
+
+    if (winningEntry) {
+        winningEntry.status = 'completed';
+        winningEntry.position = 0;
+        await winningEntry.save();
+
+        await User.findByIdAndUpdate(winningEntry.userId, {
+            isWithdrawEligible: true,
+            status: 'Withdraw Available'
+        });
+    }
+
+    // Update positions for remaining entries
     for (let i = 0; i < activeQueue.length; i++) {
-        await User.findByIdAndUpdate(activeQueue[i], { rank: i + 1 });
+        await Entry.findByIdAndUpdate(activeQueue[i], { position: i + 1 });
     }
 
     io.emit('queueUpdate', { queue: activeQueue, timer: 30 });
@@ -87,16 +137,34 @@ const processCycle = async () => {
 // --- ROUTES ---
 app.post('/api/register', async (req, res) => {
     try {
-        const { username, password, paymentScreenshot } = req.body;
+        const { username, password, paymentScreenshot, numVelos } = req.body;
         if (await User.findOne({ username })) return res.status(400).json({ message: 'Exists' });
 
         const user = new User({
             username,
             password,
             paymentScreenshot: paymentScreenshot || null,
-            status: 'Pending Verification'
+            status: 'Pending Verification',
+            velosOwned: 0 // Will be updated by admin after verification
         });
         await user.save();
+
+        if (paymentScreenshot) {
+            const settings = await Settings.findOne();
+            const entryFee = settings ? settings.entryFee : 1;
+            const totalAmount = (numVelos || 1) * entryFee;
+
+            const deposit = new Transaction({
+                userId: user._id,
+                type: 'deposit',
+                amount: totalAmount,
+                numVelos: numVelos || 1,
+                screenshot: paymentScreenshot,
+                status: 'pending'
+            });
+            await deposit.save();
+        }
+
         res.status(201).json({ message: 'Registered successfully! Please wait for admin approval.' });
     } catch (err) {
         console.error('Register error:', err);
@@ -105,80 +173,95 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username });
-    if (!user || !(await user.comparePassword(password))) return res.status(401).json({ message: 'Invalid' });
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-    res.json({ token, user });
+    try {
+        const { username, password } = req.body;
+        const user = await User.findOne({ username });
+        if (!user || !(await user.comparePassword(password))) return res.status(401).json({ message: 'Invalid' });
+        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+        res.json({ token, user });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/join-queue', async (req, res) => {
-    const { userId, amount } = req.body; // amount is the deposit amount
-    const user = await User.findById(userId);
-    const settings = await Settings.findOne();
+    try {
+        const { userId } = req.body;
+        const user = await User.findById(userId);
 
-    if (!user || user.status !== 'Verified' || user.rank > 0 || activeQueue.length >= 21) {
-        return res.status(400).json({ message: 'Cannot join. Check status or queue capacity.' });
-    }
+        if (!user || user.status !== 'Verified' || user.velosOwned <= 0 || activeQueue.length >= 21) {
+            return res.status(400).json({ message: 'Cannot join. Check status or velos.' });
+        }
 
-    // Enforce deposit rules: $1 or > $2
-    if (amount !== 1 && amount <= 2) {
-        return res.status(400).json({ message: 'Invalid deposit amount. Must be $1 or more than $2.' });
-    }
+        user.velosOwned -= 1;
+        await user.save();
 
-    // Use admin-set entry fee
-    const entryFee = settings ? settings.entryFee : 1;
-    if (user.balance < entryFee) {
-        return res.status(400).json({ message: `Insufficient balance. Entry fee is $${entryFee}` });
-    }
+        const entry = new Entry({
+            userId,
+            position: activeQueue.length + 1,
+            status: 'active'
+        });
+        await entry.save();
 
-    user.balance -= entryFee;
-    activeQueue.push(userId);
-    user.rank = activeQueue.length;
-    await user.save();
+        activeQueue.push(entry._id.toString());
 
-    io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
-    if (activeQueue.length === 21) startCycle();
-    res.json({ rank: user.rank, balance: user.balance });
+        io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
+        if (activeQueue.length === 21) startCycle();
+
+        res.json({ velosOwned: user.velosOwned, entryId: entry._id });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// User: Request Withdrawal
+app.post('/api/withdraw', async (req, res) => {
+    try {
+        const { userId, accountDetails } = req.body;
+        const user = await User.findById(userId);
+
+        if (!user || user.status !== 'Withdraw Available') {
+            return res.status(400).json({ message: 'Withdrawal not allowed' });
+        }
+
+        const withdrawal = new Transaction({
+            userId,
+            type: 'withdrawal',
+            amount: 50, // Example fixed amount or based on balance
+            accountDetails,
+            status: 'pending'
+        });
+        await withdrawal.save();
+
+        // Optionally deduct balance immediately or wait for admin payment
+        // For now, let's keep it pending and deduct upon payment in /api/admin/withdrawals/:id/pay
+
+        res.json({ message: 'Withdrawal request submitted' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Admin: Set Entry Fee
 app.post('/api/admin/settings', async (req, res) => {
-    const { entryFee } = req.body;
-    await Settings.findOneAndUpdate({}, { entryFee }, { upsert: true });
-    res.json({ message: 'Settings updated' });
+    try {
+        const { entryFee } = req.body;
+        await Settings.findOneAndUpdate({}, { entryFee }, { upsert: true });
+        res.json({ message: 'Settings updated' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Admin: Get Settings
 app.get('/api/admin/settings', async (req, res) => {
-    const settings = await Settings.findOne();
-    res.json(settings || { entryFee: 1 });
+    try {
+        const settings = await Settings.findOne();
+        res.json(settings || { entryFee: 1 });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Admin: Terminate User
 app.post('/api/admin/terminate', async (req, res) => {
-    const { userId } = req.body;
-    await User.findByIdAndUpdate(userId, { status: 'Terminated', rank: 0 });
-    // Remove from queue if present
-    activeQueue = activeQueue.filter(id => id.toString() !== userId);
-    io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
-    res.json({ message: 'User terminated' });
-});
-
-// Admin: Get all users
-app.get('/api/admin/users', async (req, res) => {
-    try {
-        const users = await User.find({ status: { $ne: 'Admin' } }).sort({ createdAt: -1 });
-        res.json(users);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin verification
-app.post('/api/admin/verify', async (req, res) => {
     try {
         const { userId } = req.body;
-        await User.findByIdAndUpdate(userId, { status: 'Verified' });
-        res.json({ message: 'Verified' });
+        await User.findByIdAndUpdate(userId, { status: 'Terminated', rank: 0 });
+        // Remove from queue if present
+        activeQueue = activeQueue.filter(id => id.toString() !== userId);
+        io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
+        res.json({ message: 'User terminated' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -187,7 +270,181 @@ app.get('/api/user/:id', async (req, res) => {
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ message: 'Not found' });
-        res.json({ status: user.status, balance: user.balance, rank: user.rank });
+
+        const entries = await Entry.find({ userId: user._id, status: 'active' }).sort({ position: 1 });
+
+        res.json({
+            status: user.status,
+            balance: user.balance,
+            velosOwned: user.velosOwned,
+            entries: entries.map(e => ({ id: e._id, position: e.position }))
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+const adminAuth = async (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ message: 'Unauthorized' });
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const user = await User.findById(decoded.id);
+
+        if (!user || user.status !== 'Admin') {
+            return res.status(403).json({ message: 'Access denied' });
+        }
+
+        req.user = user;
+        next();
+    } catch (err) { res.status(401).json({ message: 'Invalid token' }); }
+};
+
+// Admin: Get all users
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+    try {
+        const users = await User.find({ status: { $ne: 'Admin' } }).sort({ createdAt: -1 });
+        res.json(users);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Get Dashboard Stats
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+    try {
+        const totalUsers = await User.countDocuments({ status: { $ne: 'Admin' } });
+        const pendingVerifications = await User.countDocuments({ status: 'Pending Verification' });
+        const verifiedUsers = await User.countDocuments({ status: 'Verified' });
+
+        // Deposits (Sum of all completed deposits)
+        const deposits = await Transaction.aggregate([
+            { $match: { type: 'deposit', status: 'completed' } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]);
+
+        // Withdrawals (Sum of all completed withdrawals)
+        const withdrawals = await Transaction.aggregate([
+            { $match: { type: 'withdrawal', status: 'completed' } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]);
+
+        res.json({
+            totalUsers,
+            pendingVerifications,
+            verifiedUsers,
+            totalDeposits: deposits[0]?.total || 0,
+            totalWithdrawals: withdrawals[0]?.total || 0,
+            activeQueue: activeQueue.length
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Get All Deposits (Pending/All)
+app.get('/api/admin/deposits', adminAuth, async (req, res) => {
+    try {
+        const deposits = await Transaction.find({ type: 'deposit' })
+            .populate('userId', 'username')
+            .sort({ createdAt: -1 });
+        res.json(deposits);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Verify Deposit
+app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
+    try {
+        const transaction = await Transaction.findById(req.params.id);
+        if (!transaction || transaction.type !== 'deposit') return res.status(404).json({ message: 'Not found' });
+
+        transaction.status = 'completed';
+        await transaction.save();
+
+        // Update user status and velosOwned
+        await User.findByIdAndUpdate(transaction.userId, {
+            $inc: { velosOwned: transaction.numVelos || 0 },
+            $set: { status: 'Verified' } // Automatically verify user upon deposit approval
+        });
+
+        res.json({ message: 'Deposit verified, balance updated, and user verified' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Get All Withdrawals
+app.get('/api/admin/withdrawals', adminAuth, async (req, res) => {
+    try {
+        const withdrawals = await Transaction.find({ type: 'withdrawal' })
+            .populate('userId', 'username')
+            .sort({ createdAt: -1 });
+        res.json(withdrawals);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Mark Withdrawal as Paid
+app.post('/api/admin/withdrawals/:id/pay', adminAuth, async (req, res) => {
+    try {
+        const transaction = await Transaction.findById(req.params.id);
+        if (!transaction || transaction.type !== 'withdrawal' || transaction.status === 'completed') {
+            return res.status(404).json({ message: 'Valid pending withdrawal not found' });
+        }
+
+        transaction.status = 'completed';
+        await transaction.save();
+
+        // Update user: deduct balance and reset status/rank
+        await User.findByIdAndUpdate(transaction.userId, {
+            status: 'Verified',
+            isWithdrawEligible: false,
+            $inc: { balance: -transaction.amount }
+        });
+
+        res.json({ message: 'Withdrawal marked as paid and user balance updated' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Get Red-List Users
+app.get('/api/admin/red-list', adminAuth, async (req, res) => {
+    try {
+        const users = await User.find({ status: 'Red-List' }).sort({ updatedAt: -1 });
+        res.json(users);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Add to Red-List
+app.post('/api/admin/red-list/add', adminAuth, async (req, res) => {
+    try {
+        const { userId } = req.body;
+        await User.findByIdAndUpdate(userId, { status: 'Red-List', rank: 0 });
+        // Remove from queue if present
+        activeQueue = activeQueue.filter(id => id.toString() !== userId);
+        io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
+        res.json({ message: 'User added to Red-List' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Remove from Red-List (Reset to Pending or Verified?)
+app.post('/api/admin/red-list/remove/:id', adminAuth, async (req, res) => {
+    try {
+        await User.findByIdAndUpdate(req.params.id, { status: 'Verified' });
+        res.json({ message: 'User removed from Red-List and verified' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Update Credentials
+app.post('/api/admin/update-credentials', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ message: 'Unauthorized' });
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const adminUser = await User.findById(decoded.id);
+
+        if (!adminUser || adminUser.status !== 'Admin') {
+            return res.status(403).json({ message: 'Access denied' });
+        }
+
+        const { username, password } = req.body;
+        if (username) adminUser.username = username;
+        if (password) adminUser.password = password;
+
+        await adminUser.save();
+        res.json({ message: 'Admin credentials updated' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
