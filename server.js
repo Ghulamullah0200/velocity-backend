@@ -398,6 +398,19 @@ app.post('/api/admin/withdrawals/:id/pay', adminAuth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Admin: Update User Velos Manually
+app.patch('/api/admin/users/:id/velos', adminAuth, async (req, res) => {
+    try {
+        const { velosOwned } = req.body;
+        if (typeof velosOwned !== 'number') return res.status(400).json({ message: 'Invalid velo count' });
+
+        const user = await User.findByIdAndUpdate(req.params.id, { velosOwned }, { new: true });
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        res.json({ message: 'Velo count updated', velosOwned: user.velosOwned });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Admin: Get Red-List Users
 app.get('/api/admin/red-list', adminAuth, async (req, res) => {
     try {
