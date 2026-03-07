@@ -58,17 +58,14 @@ const initAdmin = async () => {
     let admin = await User.findOne({ status: 'Admin' });
     if (!admin) {
         admin = new User({
-            username: 'local',
-            password: 'local12',
+            username: 'Admin',
+            password: 'admin123',
             status: 'Admin'
         });
         await admin.save();
-        console.log('Admin created: local / local12');
+        console.log('Admin created: Admin / admin123');
     } else {
-        admin.username = 'local';
-        admin.password = 'local12';
-        await admin.save();
-        console.log('Admin credentials updated: local / local12');
+        console.log('Admin already exists. Skipping credential reset.');
     }
 };
 
@@ -357,11 +354,22 @@ app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
         transaction.status = 'completed';
         await transaction.save();
 
+        // Robust Velo Calculation
+        let velosToIncr = Number(transaction.numVelos);
+        if (!velosToIncr || velosToIncr <= 0) {
+            const settings = await Settings.findOne();
+            const entryFee = settings ? settings.entryFee : 1;
+            velosToIncr = Math.floor(transaction.amount / entryFee);
+            console.log(`Fallback Velo calculation: ${transaction.amount} / ${entryFee} = ${velosToIncr}`);
+        }
+
         // Update user status and velosOwned
         await User.findByIdAndUpdate(transaction.userId, {
-            $inc: { velosOwned: transaction.numVelos || 0 },
-            $set: { status: 'Verified' } // Automatically verify user upon deposit approval
+            $inc: { velosOwned: velosToIncr },
+            $set: { status: 'Verified' }
         });
+
+        console.log(`Deposit verified for User ${transaction.userId}. Velos added: ${velosToIncr}`);
 
         res.json({ message: 'Deposit verified, balance updated, and user verified' });
     } catch (err) { res.status(500).json({ error: err.message }); }
