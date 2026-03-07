@@ -7,7 +7,6 @@ const userSchema = new mongoose.Schema({
     status: { type: String, enum: ['Pending Verification', 'Verified', 'Admin', 'Withdraw Available', 'Red-List', 'Terminated'], default: 'Pending Verification' },
     balance: { type: Number, default: 0 },
     rank: { type: Number, default: 0 },
-    velosOwned: { type: Number, default: 0 },
     isWithdrawEligible: { type: Boolean, default: false },
     paymentScreenshot: { type: String },
     accountDetails: {
@@ -17,23 +16,9 @@ const userSchema = new mongoose.Schema({
     }
 }, { timestamps: true });
 
-userSchema.pre('save', async function (next) {
-  // 1. Only hash the password if it has been modified (or is new)
-    if (!this.isModified('password')) {
-        return next();
-    }
-
-    try {
-        // 2. Hash the password
-        const salt = await bcrypt.genSalt(10);
-        this.password = await bcrypt.hash(this.password, salt);
-        
-        // 3. In async hooks, you can just return or call next() 
-        // but don't do both. This is the safest way:
-        next();
-    } catch (error) {
-        next(error);
-    }
+userSchema.pre('save', async function () {
+    if (!this.isModified('password')) return next();
+    this.password = await bcrypt.hash(this.password, 10);
 });
 
 userSchema.methods.comparePassword = function (password) {
