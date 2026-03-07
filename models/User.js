@@ -7,6 +7,7 @@ const userSchema = new mongoose.Schema({
     status: { type: String, enum: ['Pending Verification', 'Verified', 'Admin', 'Withdraw Available', 'Red-List', 'Terminated'], default: 'Pending Verification' },
     balance: { type: Number, default: 0 },
     rank: { type: Number, default: 0 },
+    velosOwned: { type: Number, default: 0 },
     isWithdrawEligible: { type: Boolean, default: false },
     paymentScreenshot: { type: String },
     accountDetails: {
@@ -16,9 +17,10 @@ const userSchema = new mongoose.Schema({
     }
 }, { timestamps: true });
 
-userSchema.pre('save', async function () {
+userSchema.pre('save', async function (next) {
     if (!this.isModified('password')) return next();
     this.password = await bcrypt.hash(this.password, 10);
+    next();
 });
 
 userSchema.methods.comparePassword = function (password) {
