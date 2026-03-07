@@ -135,22 +135,29 @@ const processCycle = async () => {
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password, paymentScreenshot, numVelos } = req.body;
-        if (await User.findOne({ username })) return res.status(400).json({ message: 'Exists' });
+        
+        // 1. Check if user exists first
+        const existingUser = await User.findOne({ username });
+        if (existingUser) return res.status(400).json({ message: 'Exists' });
 
+        // 2. Prepare the User object (DO NOT SAVE YET)
         const user = new User({
             username,
             password,
             paymentScreenshot: paymentScreenshot || null,
             status: 'Pending Verification',
-            velosOwned: 0 // Will be updated by admin after verification
+            velosOwned: 0 
         });
-        await user.save();
 
+        // 3. If there is a screenshot, we prepare the deposit
         if (paymentScreenshot) {
-            const settings = await Settings.findOne();
-            const entryFee = settings ? settings.entryFee : 1;
+            const settings = await Settings.findOne() || { entryFee: 1 };
+            const entryFee = settings.entryFee;
             const requestedVelos = parseInt(numVelos) || 1;
             const totalAmount = requestedVelos * entryFee;
+
+            // Save the user first so we have an ID for the transaction
+            await user.save();
 
             const deposit = new Transaction({
                 userId: user._id,
@@ -160,12 +167,17 @@ app.post('/api/register', async (req, res) => {
                 screenshot: paymentScreenshot,
                 status: 'pending'
             });
+            
             await deposit.save();
+        } else {
+            // If no screenshot, just save the user
+            await user.save();
         }
 
         res.status(201).json({ message: 'Registered successfully! Please wait for admin approval.' });
     } catch (err) {
         console.error('Register error:', err);
+        // If it failed but the user was partially created, you might want to delete it here
         res.status(500).json({ error: err.message });
     }
 });
