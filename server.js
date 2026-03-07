@@ -152,13 +152,14 @@ app.post('/api/register', async (req, res) => {
         if (paymentScreenshot) {
             const settings = await Settings.findOne();
             const entryFee = settings ? settings.entryFee : 1;
-            const totalAmount = (numVelos || 1) * entryFee;
+            const requestedVelos = parseInt(numVelos) || 1;
+            const totalAmount = requestedVelos * entryFee;
 
             const deposit = new Transaction({
                 userId: user._id,
                 type: 'deposit',
                 amount: totalAmount,
-                numVelos: numVelos || 1,
+                numVelos: requestedVelos,
                 screenshot: paymentScreenshot,
                 status: 'pending'
             });
