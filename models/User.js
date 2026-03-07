@@ -18,9 +18,22 @@ const userSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 userSchema.pre('save', async function (next) {
-    if (!this.isModified('password')) return next();
-    this.password = await bcrypt.hash(this.password, 10);
-    next();
+  // 1. Only hash the password if it has been modified (or is new)
+    if (!this.isModified('password')) {
+        return next();
+    }
+
+    try {
+        // 2. Hash the password
+        const salt = await bcrypt.genSalt(10);
+        this.password = await bcrypt.hash(this.password, salt);
+        
+        // 3. In async hooks, you can just return or call next() 
+        // but don't do both. This is the safest way:
+        next();
+    } catch (error) {
+        next(error);
+    }
 });
 
 userSchema.methods.comparePassword = function (password) {
