@@ -354,25 +354,26 @@ app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
         transaction.status = 'completed';
         await transaction.save();
 
-        // Robust Velo Calculation
-        let velosToIncr = Number(transaction.numVelos);
-        if (!velosToIncr || velosToIncr <= 0) {
-            const settings = await Settings.findOne();
-            const entryFee = settings ? settings.entryFee : 1;
-            velosToIncr = Math.floor(transaction.amount / entryFee);
-            console.log(`Fallback Velo calculation: ${transaction.amount} / ${entryFee} = ${velosToIncr}`);
+        // Ensure we are getting a valid number from the transaction
+        let velosToIncr = Number(transaction.numVelos); [cite: 756]
+
+        // Fallback: If numVelos is missing, calculate it from the amount
+        if (!velosToIncr || velosToIncr <= 0) { [cite: 757]
+            const settings = await Settings.findOne(); [cite: 757]
+            const entryFee = settings ? settings.entryFee : 1; [cite: 757]
+            velosToIncr = Math.floor(transaction.amount / entryFee); [cite: 757]
         }
 
-        // Update user status and velosOwned
+        // UPDATE: Make sure the $inc operation uses the validated number
         await User.findByIdAndUpdate(transaction.userId, {
-            $inc: { velosOwned: velosToIncr },
-            $set: { status: 'Verified' }
+            $inc: { velosOwned: velosToIncr }, // This adds the velos to current count [cite: 758]
+            $set: { status: 'Verified' } // This changes the status [cite: 758]
         });
 
-        console.log(`Deposit verified for User ${transaction.userId}. Velos added: ${velosToIncr}`);
-
-        res.json({ message: 'Deposit verified, balance updated, and user verified' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.json({ message: `Verified. Added ${velosToIncr} velos.` }); [cite: 759]
+    } catch (err) { 
+        res.status(500).json({ error: err.message }); [cite: 760]
+    }
 });
 
 // Admin: Get All Withdrawals
