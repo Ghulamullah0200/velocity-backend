@@ -121,7 +121,7 @@ const processCycle = async () => {
         status: 'Withdraw Available'
     });
     console.log(`[CYCLE] User ${winningEntry.userId} awarded $10. Total balance updated.`);
-}
+
 
 // Update positions for remaining entries
 for (let i = 0; i < activeQueue.length; i++) {
