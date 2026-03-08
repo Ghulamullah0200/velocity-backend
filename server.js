@@ -58,17 +58,14 @@ const initAdmin = async () => {
     let admin = await User.findOne({ status: 'Admin' });
     if (!admin) {
         admin = new User({
-            username: 'local',
-            password: 'local12',
+            username: 'Admin',
+            password: 'admin123',
             status: 'Admin'
         });
         await admin.save();
-        console.log('Admin created: local / local12');
+        console.log('Admin created: Admin / admin123');
     } else {
-        admin.username = 'local';
-        admin.password = 'local12';
-        await admin.save();
-        console.log('Admin credentials updated: local / local12');
+        console.log('Admin already exists. Skipping credential reset.');
     }
 };
 
@@ -115,59 +112,108 @@ const processCycle = async () => {
     const entryId = activeQueue.shift();
     const winningEntry = await Entry.findById(entryId);
 
-    if (winningEntry) {
-        winningEntry.status = 'completed';
-        winningEntry.position = 0;
-        await winningEntry.save();
+    winningEntry.status = 'completed';
+    winningEntry.position = 0;
+    await winningEntry.save();
 
-        await User.findByIdAndUpdate(winningEntry.userId, {
-            isWithdrawEligible: true,
-            status: 'Withdraw Available'
-        });
-    }
+    await User.findByIdAndUpdate(winningEntry.userId, {
+        $inc: { balance: 10 },
+        status: 'Withdraw Available'
+    });
+    console.log(`[CYCLE] User ${winningEntry.userId} awarded $10. Total balance updated.`);
+}
 
-    // Update positions for remaining entries
-    for (let i = 0; i < activeQueue.length; i++) {
-        await Entry.findByIdAndUpdate(activeQueue[i], { position: i + 1 });
-    }
+// Update positions for remaining entries
+for (let i = 0; i < activeQueue.length; i++) {
+    await Entry.findByIdAndUpdate(activeQueue[i], { position: i + 1 });
+}
 
-    io.emit('queueUpdate', { queue: activeQueue, timer: 30 });
+const updatedQueue = await Entry.find({ status: 'active' }).sort({ position: 1 }).populate('userId', 'username');
+io.emit('queueUpdate', { queue: updatedQueue, timer: 30 });
 };
 
 // --- ROUTES ---
 app.post('/api/register', async (req, res) => {
+    console.log(`[REGISTER] Attempt for user: ${req.body.username}`);
     try {
-        const { username, password, paymentScreenshot, numVelos } = req.body;
-        if (await User.findOne({ username })) return res.status(400).json({ message: 'Exists' });
+        const { username, email, password } = req.body;
+
+        const existingUser = await User.findOne({ $or: [{ username }, { email }] });
+        if (existingUser) {
+            return res.status(400).json({ message: existingUser.username === username ? 'Username Exists' : 'Email Exists' });
+        }
 
         const user = new User({
             username,
+            email,
             password,
-            paymentScreenshot: paymentScreenshot || null,
-            status: 'Pending Verification',
-            velosOwned: 0 // Will be updated by admin after verification
+            status: 'Verified', // Users start as verified, but with 0 balance
+            velosOwned: 0,
+            balance: 0
         });
+
         await user.save();
 
-        if (paymentScreenshot) {
-            const settings = await Settings.findOne();
-            const entryFee = settings ? settings.entryFee : 1;
-            const totalAmount = (numVelos || 1) * entryFee;
+        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+        res.status(201).json({
+            message: 'Registered successfully!',
+            token,
+            user
+        });
+    } catch (err) {
+        console.error('--- REGISTER ERROR ---', err);
+        res.status(500).json({ error: 'Server Error', details: err.message });
+    }
+});
 
-            const deposit = new Transaction({
-                userId: user._id,
-                type: 'deposit',
-                amount: totalAmount,
-                numVelos: numVelos || 1,
-                screenshot: paymentScreenshot,
-                status: 'pending'
-            });
-            await deposit.save();
+// New Endpoint: Submit Deposit
+app.post('/api/deposit', async (req, res) => {
+    try {
+        const { userId, amount, screenshot } = req.body;
+        const deposit = new Transaction({
+            userId,
+            type: 'deposit',
+            amount: parseFloat(amount),
+            screenshot,
+            status: 'pending'
+        });
+        await deposit.save();
+        res.json({ message: 'Deposit submitted! Wait for admin verification.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// New Endpoint: Purchase Velo
+app.post('/api/purchase-velo', async (req, res) => {
+    try {
+        const { userId, numVelos } = req.body;
+        const user = await User.findById(userId);
+        const settings = await Settings.findOne() || { entryFee: 2 };
+
+        const totalCost = (numVelos || 1) * settings.entryFee;
+        if (user.balance < totalCost) {
+            return res.status(400).json({ message: 'Insufficient balance' });
         }
 
-        res.status(201).json({ message: 'Registered successfully! Please wait for admin approval.' });
+        // Create a velo purchase transaction
+        const purchase = new Transaction({
+            userId,
+            type: 'velo_purchase',
+            amount: totalCost,
+            numVelos: numVelos || 1,
+            status: 'pending'
+        });
+        await purchase.save();
+
+        // Optionally deduct balance immediately or wait for admin approval?
+        // User said "admin approval he gets velo", so let's mark it as a pending purchase.
+        // To prevent double spending, let's deduct the balance NOW and if admin rejects (not implemented yet), we could refund.
+        user.balance -= totalCost;
+        await user.save();
+
+        res.json({ message: 'Velo purchase requested! Pending admin approval..', balance: user.balance });
     } catch (err) {
-        console.error('Register error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -179,6 +225,15 @@ app.post('/api/login', async (req, res) => {
         if (!user || !(await user.comparePassword(password))) return res.status(401).json({ message: 'Invalid' });
         const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
         res.json({ token, user });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/queue', async (req, res) => {
+    try {
+        const activeEntries = await Entry.find({ status: 'active' })
+            .sort({ position: 1 })
+            .populate('userId', 'username');
+        res.json(activeEntries);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -217,22 +272,24 @@ app.post('/api/withdraw', async (req, res) => {
         const user = await User.findById(userId);
 
         if (!user || user.status !== 'Withdraw Available') {
-            return res.status(400).json({ message: 'Withdrawal not allowed' });
+            return res.status(400).json({ message: 'Withdrawal not allowed. Rank #1 required.' });
+        }
+
+        const activeEntriesCount = await Entry.countDocuments({ userId, status: 'active' });
+        if (activeEntriesCount > 0) {
+            return res.status(400).json({ message: `Cannot withdraw. ${activeEntriesCount} Velos still in queue!` });
         }
 
         const withdrawal = new Transaction({
             userId,
             type: 'withdrawal',
-            amount: 50, // Example fixed amount or based on balance
+            amount: user.balance, // Withdraw full balance
             accountDetails,
             status: 'pending'
         });
         await withdrawal.save();
 
-        // Optionally deduct balance immediately or wait for admin payment
-        // For now, let's keep it pending and deduct upon payment in /api/admin/withdrawals/:id/pay
-
-        res.json({ message: 'Withdrawal request submitted' });
+        res.json({ message: 'Withdrawal request submitted! Wait for admin payment.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -257,11 +314,14 @@ app.get('/api/admin/settings', async (req, res) => {
 app.post('/api/admin/terminate', async (req, res) => {
     try {
         const { userId } = req.body;
-        await User.findByIdAndUpdate(userId, { status: 'Terminated', rank: 0 });
+        await User.findByIdAndDelete(userId);
         // Remove from queue if present
+        await Entry.deleteMany({ userId });
         activeQueue = activeQueue.filter(id => id.toString() !== userId);
-        io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
-        res.json({ message: 'User terminated' });
+
+        const updatedQueue = await Entry.find({ status: 'active' }).sort({ position: 1 }).populate('userId', 'username');
+        io.emit('queueUpdate', { queue: updatedQueue, timer: queueTimer });
+        res.json({ message: 'User removed from system' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -299,11 +359,21 @@ const adminAuth = async (req, res, next) => {
     } catch (err) { res.status(401).json({ message: 'Invalid token' }); }
 };
 
-// Admin: Get all users
+// Admin: Get all users with their best rank
 app.get('/api/admin/users', adminAuth, async (req, res) => {
     try {
-        const users = await User.find({ status: { $ne: 'Admin' } }).sort({ createdAt: -1 });
-        res.json(users);
+        const users = await User.find({ status: { $ne: 'Admin' } }).sort({ createdAt: -1 }).lean();
+
+        // Fetch all active entries to calculate best rank for each user
+        const activeEntries = await Entry.find({ status: 'active' }).sort({ position: 1 });
+
+        const usersWithRank = users.map(user => {
+            const userEntries = activeEntries.filter(e => e.userId.toString() === user._id.toString());
+            const bestRank = userEntries.length > 0 ? Math.min(...userEntries.map(e => e.position)) : 0;
+            return { ...user, rank: bestRank };
+        });
+
+        res.json(usersWithRank);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -326,12 +396,19 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
             { $group: { _id: null, total: { $sum: '$amount' } } }
         ]);
 
+        // Total User Balances (Verified funds in system)
+        const userBalances = await User.aggregate([
+            { $match: { status: { $ne: 'Admin' } } },
+            { $group: { _id: null, total: { $sum: '$balance' } } }
+        ]);
+
         res.json({
             totalUsers,
             pendingVerifications,
             verifiedUsers,
             totalDeposits: deposits[0]?.total || 0,
             totalWithdrawals: withdrawals[0]?.total || 0,
+            totalUserBalances: userBalances[0]?.total || 0,
             activeQueue: activeQueue.length
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -347,23 +424,43 @@ app.get('/api/admin/deposits', adminAuth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Admin: Verify Deposit
-app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
+// Admin: Get All Velo Purchases (Pending/All)
+app.get('/api/admin/velo-purchases', adminAuth, async (req, res) => {
+    try {
+        const purchases = await Transaction.find({ type: 'velo_purchase' })
+            .populate('userId', 'username')
+            .sort({ createdAt: -1 });
+        res.json(purchases);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: Verify Transaction (Deposit or Velo Purchase)
+app.post('/api/admin/transactions/:id/verify', adminAuth, async (req, res) => {
     try {
         const transaction = await Transaction.findById(req.params.id);
-        if (!transaction || transaction.type !== 'deposit') return res.status(404).json({ message: 'Not found' });
+        if (!transaction || transaction.status !== 'pending') {
+            return res.status(404).json({ message: 'Pending transaction not found' });
+        }
 
         transaction.status = 'completed';
         await transaction.save();
 
-        // Update user status and velosOwned
-        await User.findByIdAndUpdate(transaction.userId, {
-            $inc: { velosOwned: transaction.numVelos || 0 },
-            $set: { status: 'Verified' } // Automatically verify user upon deposit approval
-        });
+        const user = await User.findById(transaction.userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
 
-        res.json({ message: 'Deposit verified, balance updated, and user verified' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        if (transaction.type === 'deposit') {
+            user.balance += transaction.amount;
+            console.log(`[VERIFY] Deposit of ${transaction.amount} approved for ${user.username}. New balance: ${user.balance}`);
+        } else if (transaction.type === 'velo_purchase') {
+            user.velosOwned += transaction.numVelos;
+            console.log(`[VERIFY] Velo purchase of ${transaction.numVelos} approved for ${user.username}. Total Velos: ${user.velosOwned}`);
+        }
+
+        await user.save();
+        res.json({ message: 'Transaction verified successfully', user });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Admin: Get All Withdrawals

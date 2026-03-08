@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
+    email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     status: { type: String, enum: ['Pending Verification', 'Verified', 'Admin', 'Withdraw Available', 'Red-List', 'Terminated'], default: 'Pending Verification' },
     balance: { type: Number, default: 0 },
@@ -17,10 +18,15 @@ const userSchema = new mongoose.Schema({
     }
 }, { timestamps: true });
 
-userSchema.pre('save', async function (next) {
-    if (!this.isModified('password')) return next();
-    this.password = await bcrypt.hash(this.password, 10);
-    next();
+userSchema.pre('save', async function () {
+    if (!this.isModified('password')) return;
+
+    try {
+        this.password = await bcrypt.hash(this.password, 10);
+    } catch (err) {
+        console.error('[USER MODEL] Hashing failed:', err);
+        throw err;
+    }
 });
 
 userSchema.methods.comparePassword = function (password) {
