@@ -11,556 +11,743 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] },
+    cors: { origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "PATCH"] },
     transports: ["websocket", "polling"]
 });
 
 app.use(cors({
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Health check route
-app.get('/api/health', (req, res) => res.json({ status: 'Engine Running', time: new Date() }));
-
+// Models
 const User = require('./models/User');
+const QueueSlot = require('./models/QueueSlot');
 const Transaction = require('./models/Transaction');
 const Settings = require('./models/Settings');
-const Entry = require('./models/Entry');
 
-// MongoDB connection with Robust Startup
-mongoose.connect(process.env.MONGODB_URI)
-    .then(async () => {
-        console.log('Connected to MongoDB Atlas');
-        try {
-            await initSettings();
-            await initAdmin();
-            await syncQueue();
-        } catch (err) {
-            console.error('Initialization error:', err);
-        }
-    })
-    .catch(err => console.error('MongoDB error:', err));
+// Middleware
+const { auth, adminAuth, pinVerify } = require('./middleware/auth');
 
-// Initialize Settings if not exists
-const initSettings = async () => {
-    const settings = await Settings.findOne();
-    if (!settings) {
-        await new Settings({ entryFee: 1 }).save();
-    }
-};
+// Queue Engine
+const QueueEngine = require('./services/queueEngine');
+const queueEngine = new QueueEngine(io);
 
-// Initialize Admin if not exists or reset credentials
-const initAdmin = async () => {
-    let admin = await User.findOne({ status: 'Admin' });
-    if (!admin) {
-        admin = new User({
-            username: 'Admin',
-            password: 'admin123',
-            status: 'Admin'
-        });
-        await admin.save();
-        console.log('Admin created: Admin / admin123');
-    } else {
-        console.log('Admin already exists. Skipping credential reset.');
-    }
-};
+// Health check
+app.get('/api/health', (req, res) => res.json({ status: '1 Dollar App v3.0 Running', time: new Date() }));
 
-// Sync Active Queue from Database on Startup
-const syncQueue = async () => {
-    try {
-        const activeEntries = await Entry.find({ status: 'active' }).sort({ position: 1 });
-        activeQueue = activeEntries.map(e => e._id.toString());
-        console.log(`Queue synced: ${activeQueue.length} entries`);
+// ═══════════════════════════════════════════════════
+// AUTH ROUTES
+// ═══════════════════════════════════════════════════
 
-        // If queue was full, restart cycle
-        if (activeQueue.length >= 21) {
-            startCycle();
-        }
-    } catch (err) {
-        console.error('Queue sync error:', err);
-    }
-};
-
-// --- QUEUE LOGIC ---
-let activeQueue = []; // List of Entry IDs (strings)
-let queueTimer = 30;
-let timerRunning = false;
-
-const startCycle = () => {
-    if (timerRunning) return;
-    timerRunning = true;
-    queueTimer = 30;
-    const interval = setInterval(async () => {
-        queueTimer--;
-        io.emit('timerUpdate', queueTimer);
-        if (queueTimer <= 0) {
-            clearInterval(interval);
-            timerRunning = false;
-            await processCycle();
-            if (activeQueue.length >= 21) startCycle();
-        }
-    }, 1000);
-};
-
-const processCycle = async () => {
-    if (activeQueue.length === 0) return;
-
-    const entryId = activeQueue.shift();
-    const winningEntry = await Entry.findById(entryId);
-
-    winningEntry.status = 'completed';
-    winningEntry.position = 0;
-    await winningEntry.save();
-
-    await User.findByIdAndUpdate(winningEntry.userId, {
-        $inc: { balance: 10 },
-        status: 'Withdraw Available'
-    });
-    console.log(`[CYCLE] User ${winningEntry.userId} awarded $10. Total balance updated.`);
-}
-
-// Update positions for remaining entries
-for (let i = 0; i < activeQueue.length; i++) {
-    await Entry.findByIdAndUpdate(activeQueue[i], { position: i + 1 });
-}
-
-const updatedQueue = await Entry.find({ status: 'active' }).sort({ position: 1 }).populate('userId', 'username');
-io.emit('queueUpdate', { queue: updatedQueue, timer: 30 });
-};
-
-// --- ROUTES ---
-app.post('/api/register', async (req, res) => {
-    console.log(`[REGISTER] Attempt for user: ${req.body.username}`);
+app.post('/api/auth/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
-
-        const existingUser = await User.findOne({ $or: [{ username }, { email }] });
-        if (existingUser) {
-            return res.status(400).json({ message: existingUser.username === username ? 'Username Exists' : 'Email Exists' });
+        if (!username || !email || !password) {
+            return res.status(400).json({ message: 'All fields are required' });
         }
 
-        const user = new User({
-            username,
-            email,
-            password,
-            status: 'Verified', // Users start as verified, but with 0 balance
-            velosOwned: 0,
-            balance: 0
-        });
+        const existing = await User.findOne({ $or: [{ username }, { email }] });
+        if (existing) {
+            return res.status(400).json({
+                message: existing.username === username ? 'Username already taken' : 'Email already in use'
+            });
+        }
 
+        const user = new User({ username, email, password });
         await user.save();
 
-        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.status(201).json({
-            message: 'Registered successfully!',
+            message: 'Account created successfully',
             token,
-            user
+            user: {
+                _id: user._id,
+                username: user.username,
+                email: user.email,
+                wallet: user.wallet,
+                status: user.status,
+                pinSet: user.pinSet
+            }
         });
     } catch (err) {
-        console.error('--- REGISTER ERROR ---', err);
-        res.status(500).json({ error: 'Server Error', details: err.message });
+        console.error('[REGISTER ERROR]', err);
+        res.status(500).json({ message: 'Registration failed', error: err.message });
     }
 });
 
-// New Endpoint: Submit Deposit
-app.post('/api/deposit', async (req, res) => {
-    try {
-        const { userId, amount, screenshot } = req.body;
-        const deposit = new Transaction({
-            userId,
-            type: 'deposit',
-            amount: parseFloat(amount),
-            screenshot,
-            status: 'pending'
-        });
-        await deposit.save();
-        res.json({ message: 'Deposit submitted! Wait for admin verification.' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// New Endpoint: Purchase Velo
-app.post('/api/purchase-velo', async (req, res) => {
-    try {
-        const { userId, numVelos } = req.body;
-        const user = await User.findById(userId);
-        const settings = await Settings.findOne() || { entryFee: 2 };
-
-        const totalCost = (numVelos || 1) * settings.entryFee;
-        if (user.balance < totalCost) {
-            return res.status(400).json({ message: 'Insufficient balance' });
-        }
-
-        // Create a velo purchase transaction
-        const purchase = new Transaction({
-            userId,
-            type: 'velo_purchase',
-            amount: totalCost,
-            numVelos: numVelos || 1,
-            status: 'pending'
-        });
-        await purchase.save();
-
-        // Optionally deduct balance immediately or wait for admin approval?
-        // User said "admin approval he gets velo", so let's mark it as a pending purchase.
-        // To prevent double spending, let's deduct the balance NOW and if admin rejects (not implemented yet), we could refund.
-        user.balance -= totalCost;
-        await user.save();
-
-        res.json({ message: 'Velo purchase requested! Pending admin approval..', balance: user.balance });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/api/login', async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     try {
         const { username, password } = req.body;
         const user = await User.findOne({ username });
-        if (!user || !(await user.comparePassword(password))) return res.status(401).json({ message: 'Invalid' });
-        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-        res.json({ token, user });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        if (!user || !(await user.comparePassword(password))) {
+            return res.status(401).json({ message: 'Invalid username or password' });
+        }
+        if (user.status === 'suspended') {
+            return res.status(403).json({ message: 'Account has been suspended' });
+        }
+
+        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+        res.json({
+            token,
+            user: {
+                _id: user._id,
+                username: user.username,
+                email: user.email,
+                wallet: user.wallet,
+                status: user.status,
+                pinSet: user.pinSet
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Login failed', error: err.message });
+    }
 });
 
-app.get('/api/queue', async (req, res) => {
+app.post('/api/auth/pin/setup', auth, async (req, res) => {
     try {
-        const activeEntries = await Entry.find({ status: 'active' })
+        const { pin } = req.body;
+        if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+            return res.status(400).json({ message: 'PIN must be exactly 4 digits' });
+        }
+
+        req.user.pin = pin;
+        await req.user.save();
+
+        res.json({ message: 'PIN set successfully', pinSet: true });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to set PIN', error: err.message });
+    }
+});
+
+app.post('/api/auth/pin/verify', auth, async (req, res) => {
+    try {
+        const { pin } = req.body;
+        if (!req.user.pinSet) {
+            return res.status(400).json({ message: 'PIN not set up yet' });
+        }
+        const isValid = await req.user.comparePin(pin);
+        res.json({ valid: isValid });
+    } catch (err) {
+        res.status(500).json({ message: 'Verification failed' });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// WALLET ROUTES
+// ═══════════════════════════════════════════════════
+
+app.get('/api/wallet', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        const activeSlots = await QueueSlot.find({ userId: req.userId, status: 'queued' });
+        const maturedSlots = await QueueSlot.find({ userId: req.userId, status: 'matured' });
+
+        res.json({
+            wallet: user.wallet,
+            activeSlots: activeSlots.length,
+            maturedSlots: maturedSlots.length,
+            pinSet: user.pinSet
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch wallet', error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// INVEST ROUTES
+// ═══════════════════════════════════════════════════
+
+app.post('/api/invest', auth, pinVerify, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const numDollars = parseInt(amount);
+
+        if (!numDollars || numDollars < 1) {
+            return res.status(400).json({ message: 'Minimum investment is $1' });
+        }
+
+        const result = await queueEngine.invest(req.userId, numDollars);
+        res.json({
+            message: `$${numDollars} invested into ${result.slots.length} queue slot(s)`,
+            slots: result.slots,
+            wallet: result.wallet
+        });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// QUEUE ROUTES
+// ═══════════════════════════════════════════════════
+
+app.get('/api/queue', auth, async (req, res) => {
+    try {
+        const settings = await queueEngine.getSettings();
+        const mainQueue = await QueueSlot.find({ status: 'queued', queueType: 'main' })
             .sort({ position: 1 })
             .populate('userId', 'username');
-        res.json(activeEntries);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
+        const waitlist = await QueueSlot.find({ status: 'queued', queueType: 'waitlist' })
+            .sort({ waitlistNumber: 1 })
+            .populate('userId', 'username');
 
-app.post('/api/join-queue', async (req, res) => {
-    try {
-        const { userId } = req.body;
-        const user = await User.findById(userId);
-
-        if (!user || user.status !== 'Verified' || user.velosOwned <= 0 || activeQueue.length >= 21) {
-            return res.status(400).json({ message: 'Cannot join. Check status or velos.' });
-        }
-
-        user.velosOwned -= 1;
-        await user.save();
-
-        const entry = new Entry({
-            userId,
-            position: activeQueue.length + 1,
-            status: 'active'
+        res.json({
+            mainQueue,
+            waitlist,
+            queueSize: settings.queueSize,
+            mainCount: mainQueue.length,
+            waitlistCount: waitlist.length,
+            timer: queueEngine.cycleTimer,
+            timerRunning: queueEngine.timerRunning
         });
-        await entry.save();
-
-        activeQueue.push(entry._id.toString());
-
-        io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
-        if (activeQueue.length === 21) startCycle();
-
-        res.json({ velosOwned: user.velosOwned, entryId: entry._id });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch queue', error: err.message });
+    }
 });
 
-// User: Request Withdrawal
-app.post('/api/withdraw', async (req, res) => {
+app.get('/api/queue/my-positions', auth, async (req, res) => {
     try {
-        const { userId, accountDetails } = req.body;
-        const user = await User.findById(userId);
+        const slots = await QueueSlot.find({
+            userId: req.userId,
+            status: { $in: ['queued', 'matured'] }
+        }).sort({ position: 1 });
 
-        if (!user || user.status !== 'Withdraw Available') {
-            return res.status(400).json({ message: 'Withdrawal not allowed. Rank #1 required.' });
+        res.json({
+            queued: slots.filter(s => s.status === 'queued' && s.queueType === 'main'),
+            waitlisted: slots.filter(s => s.status === 'queued' && s.queueType === 'waitlist'),
+            matured: slots.filter(s => s.status === 'matured'),
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch positions', error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// DEPOSIT ROUTES
+// ═══════════════════════════════════════════════════
+
+app.post('/api/deposit', auth, async (req, res) => {
+    try {
+        const { amount, screenshot } = req.body;
+        if (!amount || parseFloat(amount) <= 0) {
+            return res.status(400).json({ message: 'Invalid deposit amount' });
+        }
+        if (!screenshot) {
+            return res.status(400).json({ message: 'Payment screenshot required' });
         }
 
-        const activeEntriesCount = await Entry.countDocuments({ userId, status: 'active' });
-        if (activeEntriesCount > 0) {
-            return res.status(400).json({ message: `Cannot withdraw. ${activeEntriesCount} Velos still in queue!` });
+        const deposit = new Transaction({
+            userId: req.userId,
+            type: 'deposit',
+            amount: parseFloat(amount),
+            screenshot,
+            status: 'pending',
+            description: `Deposit request for $${amount}`
+        });
+        await deposit.save();
+        res.json({ message: 'Deposit submitted! Awaiting admin verification.' });
+    } catch (err) {
+        res.status(500).json({ message: 'Deposit failed', error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// WITHDRAWAL ROUTES
+// ═══════════════════════════════════════════════════
+
+app.post('/api/withdraw', auth, pinVerify, async (req, res) => {
+    try {
+        const { amount, accountDetails } = req.body;
+        const withdrawAmount = parseFloat(amount);
+
+        if (!withdrawAmount || withdrawAmount <= 0) {
+            return res.status(400).json({ message: 'Invalid withdrawal amount' });
+        }
+
+        // Atomic deduction
+        const user = await User.findOneAndUpdate(
+            { _id: req.userId, 'wallet.balance': { $gte: withdrawAmount } },
+            { $inc: { 'wallet.balance': -withdrawAmount } },
+            { new: true }
+        );
+
+        if (!user) {
+            return res.status(400).json({ message: 'Insufficient balance' });
+        }
+
+        // Save account details
+        if (accountDetails) {
+            user.accountDetails = accountDetails;
+            await user.save();
         }
 
         const withdrawal = new Transaction({
-            userId,
+            userId: req.userId,
             type: 'withdrawal',
-            amount: user.balance, // Withdraw full balance
-            accountDetails,
-            status: 'pending'
+            amount: withdrawAmount,
+            accountDetails: accountDetails || user.accountDetails,
+            status: 'pending',
+            description: `Withdrawal request for $${withdrawAmount}`
         });
         await withdrawal.save();
 
-        res.json({ message: 'Withdrawal request submitted! Wait for admin payment.' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.json({ message: 'Withdrawal request submitted!', wallet: user.wallet });
+    } catch (err) {
+        res.status(500).json({ message: 'Withdrawal failed', error: err.message });
+    }
 });
 
-// Admin: Set Entry Fee
-app.post('/api/admin/settings', async (req, res) => {
+app.post('/api/withdraw/all', auth, pinVerify, async (req, res) => {
     try {
-        const { entryFee } = req.body;
-        await Settings.findOneAndUpdate({}, { entryFee }, { upsert: true });
-        res.json({ message: 'Settings updated' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
+        const { accountDetails } = req.body;
+        const user = await User.findById(req.userId);
 
-// Admin: Get Settings
-app.get('/api/admin/settings', async (req, res) => {
-    try {
-        const settings = await Settings.findOne();
-        res.json(settings || { entryFee: 1 });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Terminate User
-app.post('/api/admin/terminate', async (req, res) => {
-    try {
-        const { userId } = req.body;
-        await User.findByIdAndDelete(userId);
-        // Remove from queue if present
-        await Entry.deleteMany({ userId });
-        activeQueue = activeQueue.filter(id => id.toString() !== userId);
-
-        const updatedQueue = await Entry.find({ status: 'active' }).sort({ position: 1 }).populate('userId', 'username');
-        io.emit('queueUpdate', { queue: updatedQueue, timer: queueTimer });
-        res.json({ message: 'User removed from system' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// User: Get status
-app.get('/api/user/:id', async (req, res) => {
-    try {
-        const user = await User.findById(req.params.id);
-        if (!user) return res.status(404).json({ message: 'Not found' });
-
-        const entries = await Entry.find({ userId: user._id, status: 'active' }).sort({ position: 1 });
-
-        res.json({
-            status: user.status,
-            balance: user.balance,
-            velosOwned: user.velosOwned,
-            entries: entries.map(e => ({ id: e._id, position: e.position }))
-        });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-const adminAuth = async (req, res, next) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) return res.status(401).json({ message: 'Unauthorized' });
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id);
-
-        if (!user || user.status !== 'Admin') {
-            return res.status(403).json({ message: 'Access denied' });
+        if (!user || user.wallet.balance <= 0) {
+            return res.status(400).json({ message: 'No balance to withdraw' });
         }
 
-        req.user = user;
-        next();
-    } catch (err) { res.status(401).json({ message: 'Invalid token' }); }
-};
+        const withdrawAmount = user.wallet.balance;
 
-// Admin: Get all users with their best rank
-app.get('/api/admin/users', adminAuth, async (req, res) => {
-    try {
-        const users = await User.find({ status: { $ne: 'Admin' } }).sort({ createdAt: -1 }).lean();
+        const updated = await User.findOneAndUpdate(
+            { _id: req.userId, 'wallet.balance': { $gte: withdrawAmount } },
+            { $inc: { 'wallet.balance': -withdrawAmount } },
+            { new: true }
+        );
 
-        // Fetch all active entries to calculate best rank for each user
-        const activeEntries = await Entry.find({ status: 'active' }).sort({ position: 1 });
+        if (!updated) return res.status(400).json({ message: 'Failed to process' });
 
-        const usersWithRank = users.map(user => {
-            const userEntries = activeEntries.filter(e => e.userId.toString() === user._id.toString());
-            const bestRank = userEntries.length > 0 ? Math.min(...userEntries.map(e => e.position)) : 0;
-            return { ...user, rank: bestRank };
+        if (accountDetails) {
+            updated.accountDetails = accountDetails;
+            await updated.save();
+        }
+
+        const withdrawal = new Transaction({
+            userId: req.userId,
+            type: 'withdrawal',
+            amount: withdrawAmount,
+            accountDetails: accountDetails || updated.accountDetails,
+            status: 'pending',
+            description: `Full withdrawal of $${withdrawAmount}`
         });
+        await withdrawal.save();
 
-        res.json(usersWithRank);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.json({ message: 'Full withdrawal submitted!', wallet: updated.wallet });
+    } catch (err) {
+        res.status(500).json({ message: 'Withdrawal failed', error: err.message });
+    }
 });
 
-// Admin: Get Dashboard Stats
+app.post('/api/withdraw/:id/cancel', auth, async (req, res) => {
+    try {
+        const transaction = await Transaction.findOne({
+            _id: req.params.id,
+            userId: req.userId,
+            type: 'withdrawal',
+            status: 'pending'
+        });
+
+        if (!transaction) return res.status(404).json({ message: 'Pending withdrawal not found' });
+
+        // Refund
+        await User.findByIdAndUpdate(req.userId, {
+            $inc: { 'wallet.balance': transaction.amount }
+        });
+
+        transaction.status = 'rejected';
+        transaction.description += ' (Cancelled by user)';
+        await transaction.save();
+
+        const user = await User.findById(req.userId);
+        res.json({ message: 'Withdrawal cancelled and refunded', wallet: user.wallet });
+    } catch (err) {
+        res.status(500).json({ message: 'Cancellation failed', error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// REINVEST ROUTE
+// ═══════════════════════════════════════════════════
+
+app.post('/api/reinvest', auth, pinVerify, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const numDollars = parseInt(amount);
+
+        if (!numDollars || numDollars < 1) {
+            return res.status(400).json({ message: 'Minimum reinvestment is $1' });
+        }
+
+        // Record reinvest transaction
+        await new Transaction({
+            userId: req.userId,
+            type: 'reinvest',
+            amount: numDollars,
+            status: 'completed',
+            description: `Reinvested $${numDollars} from earnings`
+        }).save();
+
+        const result = await queueEngine.invest(req.userId, numDollars);
+        res.json({
+            message: `$${numDollars} reinvested into queue`,
+            slots: result.slots,
+            wallet: result.wallet
+        });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// TRANSACTION HISTORY
+// ═══════════════════════════════════════════════════
+
+app.get('/api/transactions', auth, async (req, res) => {
+    try {
+        const transactions = await Transaction.find({ userId: req.userId })
+            .sort({ createdAt: -1 })
+            .limit(50);
+        res.json(transactions);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch transactions' });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// USER STATUS (for polling)
+// ═══════════════════════════════════════════════════
+
+app.get('/api/user/status', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        const activeSlots = await QueueSlot.find({
+            userId: req.userId,
+            status: 'queued'
+        }).sort({ position: 1 });
+
+        const maturedSlots = await QueueSlot.find({
+            userId: req.userId,
+            status: 'matured'
+        });
+
+        res.json({
+            wallet: user.wallet,
+            status: user.status,
+            pinSet: user.pinSet,
+            username: user.username,
+            activeSlots: activeSlots.map(s => ({
+                id: s._id,
+                position: s.position,
+                queueType: s.queueType,
+                waitlistNumber: s.waitlistNumber
+            })),
+            maturedCount: maturedSlots.length,
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch status' });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// ADMIN ROUTES
+// ═══════════════════════════════════════════════════
+
 app.get('/api/admin/stats', adminAuth, async (req, res) => {
     try {
-        const totalUsers = await User.countDocuments({ status: { $ne: 'Admin' } });
-        const pendingVerifications = await User.countDocuments({ status: 'Pending Verification' });
-        const verifiedUsers = await User.countDocuments({ status: 'Verified' });
+        const totalUsers = await User.countDocuments({ status: { $ne: 'admin' } });
+        const activeUsers = await User.countDocuments({ status: 'active' });
+        const suspendedUsers = await User.countDocuments({ status: 'suspended' });
+        const mainQueueCount = await QueueSlot.countDocuments({ status: 'queued', queueType: 'main' });
+        const waitlistCount = await QueueSlot.countDocuments({ status: 'queued', queueType: 'waitlist' });
 
-        // Deposits (Sum of all completed deposits)
         const deposits = await Transaction.aggregate([
             { $match: { type: 'deposit', status: 'completed' } },
             { $group: { _id: null, total: { $sum: '$amount' } } }
         ]);
-
-        // Withdrawals (Sum of all completed withdrawals)
         const withdrawals = await Transaction.aggregate([
             { $match: { type: 'withdrawal', status: 'completed' } },
             { $group: { _id: null, total: { $sum: '$amount' } } }
         ]);
+        const pendingDeposits = await Transaction.countDocuments({ type: 'deposit', status: 'pending' });
+        const pendingWithdrawals = await Transaction.countDocuments({ type: 'withdrawal', status: 'pending' });
 
-        // Total User Balances (Verified funds in system)
         const userBalances = await User.aggregate([
-            { $match: { status: { $ne: 'Admin' } } },
-            { $group: { _id: null, total: { $sum: '$balance' } } }
+            { $match: { status: { $ne: 'admin' } } },
+            { $group: { _id: null, total: { $sum: '$wallet.balance' } } }
         ]);
 
         res.json({
-            totalUsers,
-            pendingVerifications,
-            verifiedUsers,
+            totalUsers, activeUsers, suspendedUsers,
+            mainQueueCount, waitlistCount,
             totalDeposits: deposits[0]?.total || 0,
             totalWithdrawals: withdrawals[0]?.total || 0,
-            totalUserBalances: userBalances[0]?.total || 0,
-            activeQueue: activeQueue.length
+            pendingDeposits, pendingWithdrawals,
+            totalUserBalances: userBalances[0]?.total || 0
         });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch stats', error: err.message });
+    }
 });
 
-// Admin: Get All Deposits (Pending/All)
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+    try {
+        const users = await User.find({ status: { $ne: 'admin' } })
+            .select('-password -pin')
+            .sort({ createdAt: -1 })
+            .lean();
+
+        const usersWithSlots = await Promise.all(users.map(async user => {
+            const activeSlots = await QueueSlot.countDocuments({ userId: user._id, status: 'queued' });
+            return { ...user, activeSlots };
+        }));
+
+        res.json(usersWithSlots);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch users', error: err.message });
+    }
+});
+
 app.get('/api/admin/deposits', adminAuth, async (req, res) => {
     try {
         const deposits = await Transaction.find({ type: 'deposit' })
             .populate('userId', 'username')
             .sort({ createdAt: -1 });
         res.json(deposits);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Get All Velo Purchases (Pending/All)
-app.get('/api/admin/velo-purchases', adminAuth, async (req, res) => {
-    try {
-        const purchases = await Transaction.find({ type: 'velo_purchase' })
-            .populate('userId', 'username')
-            .sort({ createdAt: -1 });
-        res.json(purchases);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Verify Transaction (Deposit or Velo Purchase)
-app.post('/api/admin/transactions/:id/verify', adminAuth, async (req, res) => {
-    try {
-        const transaction = await Transaction.findById(req.params.id);
-        if (!transaction || transaction.status !== 'pending') {
-            return res.status(404).json({ message: 'Pending transaction not found' });
-        }
-
-        transaction.status = 'completed';
-        await transaction.save();
-
-        const user = await User.findById(transaction.userId);
-        if (!user) return res.status(404).json({ message: 'User not found' });
-
-        if (transaction.type === 'deposit') {
-            user.balance += transaction.amount;
-            console.log(`[VERIFY] Deposit of ${transaction.amount} approved for ${user.username}. New balance: ${user.balance}`);
-        } else if (transaction.type === 'velo_purchase') {
-            user.velosOwned += transaction.numVelos;
-            console.log(`[VERIFY] Velo purchase of ${transaction.numVelos} approved for ${user.username}. Total Velos: ${user.velosOwned}`);
-        }
-
-        await user.save();
-        res.json({ message: 'Transaction verified successfully', user });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// Admin: Get All Withdrawals
+app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
+    try {
+        const transaction = await Transaction.findById(req.params.id);
+        if (!transaction || transaction.status !== 'pending' || transaction.type !== 'deposit') {
+            return res.status(404).json({ message: 'Pending deposit not found' });
+        }
+
+        transaction.status = 'completed';
+        await transaction.save();
+
+        await User.findByIdAndUpdate(transaction.userId, {
+            $inc: { 'wallet.balance': transaction.amount }
+        });
+
+        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId}`);
+        res.json({ message: 'Deposit verified and credited' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/deposits/:id/reject', adminAuth, async (req, res) => {
+    try {
+        const transaction = await Transaction.findById(req.params.id);
+        if (!transaction || transaction.status !== 'pending') {
+            return res.status(404).json({ message: 'Pending deposit not found' });
+        }
+
+        transaction.status = 'rejected';
+        await transaction.save();
+        res.json({ message: 'Deposit rejected' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/admin/withdrawals', adminAuth, async (req, res) => {
     try {
         const withdrawals = await Transaction.find({ type: 'withdrawal' })
             .populate('userId', 'username')
             .sort({ createdAt: -1 });
         res.json(withdrawals);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Admin: Mark Withdrawal as Paid
 app.post('/api/admin/withdrawals/:id/pay', adminAuth, async (req, res) => {
     try {
         const transaction = await Transaction.findById(req.params.id);
-        if (!transaction || transaction.type !== 'withdrawal' || transaction.status === 'completed') {
-            return res.status(404).json({ message: 'Valid pending withdrawal not found' });
+        if (!transaction || transaction.type !== 'withdrawal' || transaction.status !== 'pending') {
+            return res.status(404).json({ message: 'Pending withdrawal not found' });
         }
 
         transaction.status = 'completed';
         await transaction.save();
-
-        // Update user: deduct balance and reset status/rank
-        await User.findByIdAndUpdate(transaction.userId, {
-            status: 'Verified',
-            isWithdrawEligible: false,
-            $inc: { balance: -transaction.amount }
-        });
-
-        res.json({ message: 'Withdrawal marked as paid and user balance updated' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        console.log(`[ADMIN] Withdrawal $${transaction.amount} paid to user ${transaction.userId}`);
+        res.json({ message: 'Withdrawal marked as paid' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Admin: Update User Velos Manually
-app.patch('/api/admin/users/:id/velos', adminAuth, async (req, res) => {
+app.post('/api/admin/withdrawals/:id/reject', adminAuth, async (req, res) => {
     try {
-        const { velosOwned } = req.body;
-        if (typeof velosOwned !== 'number') return res.status(400).json({ message: 'Invalid velo count' });
-
-        const user = await User.findByIdAndUpdate(req.params.id, { velosOwned }, { new: true });
-        if (!user) return res.status(404).json({ message: 'User not found' });
-
-        res.json({ message: 'Velo count updated', velosOwned: user.velosOwned });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Get Red-List Users
-app.get('/api/admin/red-list', adminAuth, async (req, res) => {
-    try {
-        const users = await User.find({ status: 'Red-List' }).sort({ updatedAt: -1 });
-        res.json(users);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Add to Red-List
-app.post('/api/admin/red-list/add', adminAuth, async (req, res) => {
-    try {
-        const { userId } = req.body;
-        await User.findByIdAndUpdate(userId, { status: 'Red-List', rank: 0 });
-        // Remove from queue if present
-        activeQueue = activeQueue.filter(id => id.toString() !== userId);
-        io.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
-        res.json({ message: 'User added to Red-List' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Remove from Red-List (Reset to Pending or Verified?)
-app.post('/api/admin/red-list/remove/:id', adminAuth, async (req, res) => {
-    try {
-        await User.findByIdAndUpdate(req.params.id, { status: 'Verified' });
-        res.json({ message: 'User removed from Red-List and verified' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Admin: Update Credentials
-app.post('/api/admin/update-credentials', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) return res.status(401).json({ message: 'Unauthorized' });
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const adminUser = await User.findById(decoded.id);
-
-        if (!adminUser || adminUser.status !== 'Admin') {
-            return res.status(403).json({ message: 'Access denied' });
+        const transaction = await Transaction.findById(req.params.id);
+        if (!transaction || transaction.type !== 'withdrawal' || transaction.status !== 'pending') {
+            return res.status(404).json({ message: 'Pending withdrawal not found' });
         }
 
-        const { username, password } = req.body;
-        if (username) adminUser.username = username;
-        if (password) adminUser.password = password;
+        // Refund the user
+        await User.findByIdAndUpdate(transaction.userId, {
+            $inc: { 'wallet.balance': transaction.amount }
+        });
 
-        await adminUser.save();
-        res.json({ message: 'Admin credentials updated' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        transaction.status = 'rejected';
+        await transaction.save();
+        res.json({ message: 'Withdrawal rejected and refunded' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
+
+app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
+    try {
+        const userId = req.params.id;
+        await User.findByIdAndUpdate(userId, { status: 'suspended' });
+
+        // Cancel active queue slots and refund
+        const activeSlots = await QueueSlot.find({ userId, status: 'queued' });
+        if (activeSlots.length > 0) {
+            const refundAmount = activeSlots.reduce((sum, s) => sum + s.amount, 0);
+            await QueueSlot.updateMany({ userId, status: 'queued' }, { status: 'cancelled' });
+            await User.findByIdAndUpdate(userId, {
+                $inc: { 'wallet.balance': refundAmount, 'wallet.activeInQueue': -refundAmount }
+            });
+        }
+
+        await queueEngine.broadcastState();
+        res.json({ message: 'User suspended and queue slots cancelled' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/users/:id/activate', adminAuth, async (req, res) => {
+    try {
+        await User.findByIdAndUpdate(req.params.id, { status: 'active' });
+        res.json({ message: 'User activated' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/users/:id/add-balance', adminAuth, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        if (!amount || amount <= 0) return res.status(400).json({ message: 'Invalid amount' });
+
+        const user = await User.findByIdAndUpdate(
+            req.params.id,
+            { $inc: { 'wallet.balance': amount } },
+            { new: true }
+        );
+        res.json({ message: `$${amount} added`, wallet: user.wallet });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/queue', adminAuth, async (req, res) => {
+    try {
+        const mainQueue = await QueueSlot.find({ status: 'queued', queueType: 'main' })
+            .sort({ position: 1 })
+            .populate('userId', 'username');
+        const waitlist = await QueueSlot.find({ status: 'queued', queueType: 'waitlist' })
+            .sort({ waitlistNumber: 1 })
+            .populate('userId', 'username');
+        const settings = await queueEngine.getSettings();
+
+        res.json({ mainQueue, waitlist, settings, timer: queueEngine.cycleTimer });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/settings', adminAuth, async (req, res) => {
+    try {
+        const allowedFields = ['queueSize', 'waitlistStart', 'waitlistMax', 'maturityMultiplier', 'cycleTimerSeconds', 'autoPromote', 'minDeposit'];
+        const updates = {};
+        allowedFields.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
+
+        await Settings.findOneAndUpdate({}, updates, { upsert: true });
+        res.json({ message: 'Settings updated' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/settings', adminAuth, async (req, res) => {
+    try {
+        const settings = await Settings.findOne();
+        res.json(settings || {});
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/update-credentials', adminAuth, async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        if (username) req.user.username = username;
+        if (password) req.user.password = password;
+        await req.user.save();
+        res.json({ message: 'Admin credentials updated' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// SOCKET.IO
+// ═══════════════════════════════════════════════════
 
 io.on('connection', (socket) => {
-    socket.emit('queueUpdate', { queue: activeQueue, timer: queueTimer });
+    queueEngine.broadcastState();
 });
 
+// ═══════════════════════════════════════════════════
+// INITIALIZATION
+// ═══════════════════════════════════════════════════
+
+const initSettings = async () => {
+    const settings = await Settings.findOne();
+    if (!settings) {
+        await new Settings({}).save();
+        console.log('[INIT] Default settings created');
+    }
+};
+
+const initAdmin = async () => {
+    let admin = await User.findOne({ status: 'admin' });
+    if (!admin) {
+        admin = new User({
+            username: 'Admin',
+            email: 'admin@1dollar.app',
+            password: 'admin123',
+            status: 'admin'
+        });
+        await admin.save();
+        console.log('[INIT] Admin created: Admin / admin123');
+    }
+};
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI)
+    .then(async () => {
+        console.log('[DB] Connected to MongoDB Atlas');
+        try {
+            await initSettings();
+            await initAdmin();
+            await queueEngine.initialize();
+        } catch (err) {
+            console.error('[INIT ERROR]', err);
+        }
+    })
+    .catch(err => console.error('[DB ERROR]', err));
+
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server on ${PORT}`));
+server.listen(PORT, () => console.log(`[1 DOLLAR APP] Server running on port ${PORT}`));
