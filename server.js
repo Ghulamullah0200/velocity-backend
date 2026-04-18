@@ -23,14 +23,19 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Serve static files from uploads directory
+app.use('/uploads', express.static('uploads'));
+
 // Models
 const User = require('./models/User');
 const QueueSlot = require('./models/QueueSlot');
 const Transaction = require('./models/Transaction');
 const Settings = require('./models/Settings');
+const BankDetail = require('./models/BankDetail');
 
 // Middleware
 const { auth, adminAuth, pinVerify } = require('./middleware/auth');
+const upload = require('./middleware/upload');
 
 // Queue Engine
 const QueueEngine = require('./services/queueEngine');
@@ -227,24 +232,86 @@ app.get('/api/queue/my-positions', auth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
+// BANK DETAILS ROUTES
+// ═══════════════════════════════════════════════════
+
+// Get active bank details (for users)
+app.get('/api/bank-details', async (req, res) => {
+    try {
+        const activeDetail = await BankDetail.findOne({ isActive: true }).sort({ publishedAt: -1 });
+        if (!activeDetail) {
+            return res.json({ message: 'No bank details published yet' });
+        }
+        res.json(activeDetail);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch bank details', error: err.message });
+    }
+});
+
+// Admin: Get all bank detail records
+app.get('/api/admin/bank-details', adminAuth, async (req, res) => {
+    try {
+        const records = await BankDetail.find().sort({ publishedAt: -1 });
+        res.json(records);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Admin: Publish/Update bank details (only one active at a time)
+app.post('/api/admin/bank-details', adminAuth, async (req, res) => {
+    try {
+        const { accountNumber, bankName, accountTitle, additionalInstructions } = req.body;
+        if (!accountNumber || !accountTitle) {
+            return res.status(400).json({ message: 'Account Title and Account Number are required' });
+        }
+
+        // Deactivate all existing records
+        await BankDetail.updateMany({}, { $set: { isActive: false } });
+
+        // Create new active record
+        const newDetail = new BankDetail({
+            accountNumber,
+            bankName: bankName || '',
+            accountTitle,
+            additionalInstructions: additionalInstructions || '',
+            isActive: true,
+            publishedAt: new Date()
+        });
+        await newDetail.save();
+
+        // Emit real-time update to all connected clients
+        io.emit('bankDetailsUpdated', newDetail);
+
+        res.json({ message: 'Bank details published successfully', bankDetail: newDetail });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
 // DEPOSIT ROUTES
 // ═══════════════════════════════════════════════════
 
-app.post('/api/deposit', auth, async (req, res) => {
+app.post('/api/deposit', auth, upload.single('screenshot'), async (req, res) => {
     try {
-        const { amount, screenshot } = req.body;
+        const { amount } = req.body;
         if (!amount || parseFloat(amount) <= 0) {
             return res.status(400).json({ message: 'Invalid deposit amount' });
         }
-        if (!screenshot) {
+        if (!req.file) {
             return res.status(400).json({ message: 'Payment screenshot required' });
         }
+
+        // Build file URL (adjust based on deployment)
+        const baseUrl = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
+        const screenshotUrl = `${baseUrl}/uploads/${req.file.filename}`;
 
         const deposit = new Transaction({
             userId: req.userId,
             type: 'deposit',
             amount: parseFloat(amount),
-            screenshot,
+            screenshot: screenshotUrl,
             status: 'pending',
             description: `Deposit request for $${amount}`
         });
@@ -522,23 +589,33 @@ app.get('/api/admin/deposits', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
+    const session = await mongoose.startSession()
+    session.startTransaction()
+
     try {
-        const transaction = await Transaction.findById(req.params.id);
+        const transaction = await Transaction.findById(req.params.id).session(session)
         if (!transaction || transaction.status !== 'pending' || transaction.type !== 'deposit') {
-            return res.status(404).json({ message: 'Pending deposit not found' });
+            await session.abortTransaction()
+            session.end()
+            return res.status(404).json({ message: 'Pending deposit not found' })
         }
 
-        transaction.status = 'completed';
-        await transaction.save();
+        transaction.status = 'completed'
+        await transaction.save()
 
         await User.findByIdAndUpdate(transaction.userId, {
             $inc: { 'wallet.balance': transaction.amount }
-        });
+        }).session(session)
 
-        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId}`);
-        res.json({ message: 'Deposit verified and credited' });
+        await session.commitTransaction()
+        session.end()
+
+        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId}`)
+        res.json({ message: 'Deposit verified and credited' })
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        await session.abortTransaction()
+        session.end()
+        res.status(500).json({ error: err.message })
     }
 });
 
@@ -722,7 +799,7 @@ const initSettings = async () => {
 };
 
 const initAdmin = async () => {
-    let admin = await User.findOne({ status: 'admin' });
+    let admin = await User.findOne({ username: 'Admin' });
     if (!admin) {
         admin = new User({
             username: 'Admin',
@@ -732,6 +809,23 @@ const initAdmin = async () => {
         });
         await admin.save();
         console.log('[INIT] Admin created: Admin / admin123');
+    } else {
+        // Ensure status is 'admin' and email is set (fix if previously created as regular user or missing email)
+        let needsSave = false;
+        if (admin.status !== 'admin') {
+            admin.status = 'admin';
+            needsSave = true;
+        }
+        if (!admin.email) {
+            admin.email = 'admin@1dollar.app';
+            needsSave = true;
+        }
+        if (needsSave) {
+            await admin.save();
+            console.log('[INIT] Admin user updated (status/email fixed)');
+        } else {
+            console.log('[INIT] Admin already exists with correct status');
+        }
     }
 };
 
