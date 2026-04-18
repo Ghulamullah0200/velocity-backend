@@ -4,7 +4,7 @@ const settingsSchema = new mongoose.Schema({
     queueSize: { type: Number, default: 21 },
     waitlistStart: { type: Number, default: 22 },
     waitlistMax: { type: Number, default: 2222 },
-    maturityMultiplier: { type: Number, default: 2 },
+    maturityMultiplier: { type: Number, default: 10 },
     cycleTimerSeconds: { type: Number, default: 30 },
     autoPromote: { type: Boolean, default: true },
     minDeposit: { type: Number, default: 1 },
