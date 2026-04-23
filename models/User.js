@@ -21,6 +21,12 @@ const userSchema = new mongoose.Schema({
         type: String,
         enum: ['active', 'suspended', 'admin'],
         default: 'active'
+    },
+    queueStatus: {
+        type: String,
+        enum: ['eligible', 'in_queue', 'expired'],
+        default: 'eligible',
+        index: true
     }
 }, { timestamps: true });
 

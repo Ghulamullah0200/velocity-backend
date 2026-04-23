@@ -4,7 +4,7 @@ const transactionSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     type: {
         type: String,
-        enum: ['deposit', 'withdrawal', 'invest', 'earning', 'reinvest'],
+        enum: ['deposit', 'withdrawal', 'queue_entry', 'earning', 'invest', 'reinvest'],
         required: true,
         index: true
     },
@@ -25,5 +25,6 @@ const transactionSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 transactionSchema.index({ userId: 1, type: 1, createdAt: -1 });
+transactionSchema.index({ type: 1, status: 1, createdAt: -1 }); // Admin queries
 
 module.exports = mongoose.model('Transaction', transactionSchema);

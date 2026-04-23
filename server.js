@@ -42,7 +42,7 @@ const QueueEngine = require('./services/queueEngine');
 const queueEngine = new QueueEngine(io);
 
 // Health check
-app.get('/api/health', (req, res) => res.json({ status: '1 Dollar App v3.0 Running', time: new Date() }));
+app.get('/api/health', (req, res) => res.json({ status: '1 Dollar App v4.0 Running', time: new Date() }));
 
 // ═══════════════════════════════════════════════════
 // AUTH ROUTES
@@ -75,7 +75,8 @@ app.post('/api/auth/register', async (req, res) => {
                 email: user.email,
                 wallet: user.wallet,
                 status: user.status,
-                pinSet: user.pinSet
+                pinSet: user.pinSet,
+                queueStatus: user.queueStatus
             }
         });
     } catch (err) {
@@ -104,7 +105,8 @@ app.post('/api/auth/login', async (req, res) => {
                 email: user.email,
                 wallet: user.wallet,
                 status: user.status,
-                pinSet: user.pinSet
+                pinSet: user.pinSet,
+                queueStatus: user.queueStatus
             }
         });
     } catch (err) {
@@ -148,41 +150,18 @@ app.post('/api/auth/pin/verify', auth, async (req, res) => {
 app.get('/api/wallet', auth, async (req, res) => {
     try {
         const user = await User.findById(req.userId);
-        const activeSlots = await QueueSlot.find({ userId: req.userId, status: 'queued' });
-        const maturedSlots = await QueueSlot.find({ userId: req.userId, status: 'matured' });
+        const activeSlots = await QueueSlot.countDocuments({ userId: req.userId, status: 'active' });
+        const completedSlots = await QueueSlot.countDocuments({ userId: req.userId, status: 'completed' });
 
         res.json({
             wallet: user.wallet,
-            activeSlots: activeSlots.length,
-            maturedSlots: maturedSlots.length,
-            pinSet: user.pinSet
+            activeSlots,
+            maturedSlots: completedSlots,
+            pinSet: user.pinSet,
+            queueStatus: user.queueStatus
         });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch wallet', error: err.message });
-    }
-});
-
-// ═══════════════════════════════════════════════════
-// INVEST ROUTES
-// ═══════════════════════════════════════════════════
-
-app.post('/api/invest', auth, pinVerify, async (req, res) => {
-    try {
-        const { amount } = req.body;
-        const numDollars = parseInt(amount);
-
-        if (!numDollars || numDollars < 1) {
-            return res.status(400).json({ message: 'Minimum investment is $1' });
-        }
-
-        const result = await queueEngine.invest(req.userId, numDollars);
-        res.json({
-            message: `$${numDollars} invested into ${result.slots.length} queue slot(s)`,
-            slots: result.slots,
-            wallet: result.wallet
-        });
-    } catch (err) {
-        res.status(400).json({ message: err.message });
     }
 });
 
@@ -193,12 +172,27 @@ app.post('/api/invest', auth, pinVerify, async (req, res) => {
 app.get('/api/queue', auth, async (req, res) => {
     try {
         const settings = await queueEngine.getSettings();
-        const mainQueue = await QueueSlot.find({ status: 'queued', queueType: 'main' })
+        const mainQueue = await QueueSlot.find({ status: 'active', queueType: 'main' })
             .sort({ position: 1 })
             .populate('userId', 'username');
-        const waitlist = await QueueSlot.find({ status: 'queued', queueType: 'waitlist' })
+        const waitlist = await QueueSlot.find({ status: 'waiting', queueType: 'waitlist' })
             .sort({ waitlistNumber: 1 })
             .populate('userId', 'username');
+
+        // Get withdrawal timer for top slot
+        const topSlot = mainQueue.find(s => s.position === 1);
+        let withdrawalTimer = null;
+        if (topSlot && topSlot.withdrawalDeadline) {
+            const remaining = Math.max(0, new Date(topSlot.withdrawalDeadline).getTime() - Date.now());
+            withdrawalTimer = {
+                slotId: topSlot._id,
+                userId: topSlot.userId,
+                deadline: topSlot.withdrawalDeadline,
+                remainingMs: remaining,
+                remainingHours: Math.floor(remaining / (1000 * 60 * 60)),
+                remainingMinutes: Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60)),
+            };
+        }
 
         res.json({
             mainQueue,
@@ -207,7 +201,8 @@ app.get('/api/queue', auth, async (req, res) => {
             mainCount: mainQueue.length,
             waitlistCount: waitlist.length,
             timer: queueEngine.cycleTimer,
-            timerRunning: queueEngine.timerRunning
+            timerRunning: queueEngine.timerRunning,
+            withdrawalTimer,
         });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch queue', error: err.message });
@@ -218,13 +213,13 @@ app.get('/api/queue/my-positions', auth, async (req, res) => {
     try {
         const slots = await QueueSlot.find({
             userId: req.userId,
-            status: { $in: ['queued', 'matured'] }
+            status: { $in: ['active', 'waiting', 'completed'] }
         }).sort({ position: 1 });
 
         res.json({
-            queued: slots.filter(s => s.status === 'queued' && s.queueType === 'main'),
-            waitlisted: slots.filter(s => s.status === 'queued' && s.queueType === 'waitlist'),
-            matured: slots.filter(s => s.status === 'matured'),
+            queued: slots.filter(s => s.status === 'active' && s.queueType === 'main'),
+            waitlisted: slots.filter(s => s.status === 'waiting' && s.queueType === 'waitlist'),
+            matured: slots.filter(s => s.status === 'completed'),
         });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch positions', error: err.message });
@@ -235,7 +230,6 @@ app.get('/api/queue/my-positions', auth, async (req, res) => {
 // BANK DETAILS ROUTES
 // ═══════════════════════════════════════════════════
 
-// Get active bank details (for users)
 app.get('/api/bank-details', async (req, res) => {
     try {
         const activeDetail = await BankDetail.findOne({ isActive: true }).sort({ publishedAt: -1 });
@@ -248,7 +242,6 @@ app.get('/api/bank-details', async (req, res) => {
     }
 });
 
-// Admin: Get all bank detail records
 app.get('/api/admin/bank-details', adminAuth, async (req, res) => {
     try {
         const records = await BankDetail.find().sort({ publishedAt: -1 });
@@ -258,7 +251,6 @@ app.get('/api/admin/bank-details', adminAuth, async (req, res) => {
     }
 });
 
-// Admin: Publish/Update bank details (only one active at a time)
 app.post('/api/admin/bank-details', adminAuth, async (req, res) => {
     try {
         const { accountNumber, bankName, accountTitle, additionalInstructions } = req.body;
@@ -266,10 +258,8 @@ app.post('/api/admin/bank-details', adminAuth, async (req, res) => {
             return res.status(400).json({ message: 'Account Title and Account Number are required' });
         }
 
-        // Deactivate all existing records
         await BankDetail.updateMany({}, { $set: { isActive: false } });
 
-        // Create new active record
         const newDetail = new BankDetail({
             accountNumber,
             bankName: bankName || '',
@@ -280,9 +270,7 @@ app.post('/api/admin/bank-details', adminAuth, async (req, res) => {
         });
         await newDetail.save();
 
-        // Emit real-time update to all connected clients
         io.emit('bankDetailsUpdated', newDetail);
-
         res.json({ message: 'Bank details published successfully', bankDetail: newDetail });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -290,30 +278,38 @@ app.post('/api/admin/bank-details', adminAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
-// DEPOSIT ROUTES
+// DEPOSIT ROUTES (Strictly $1 only)
 // ═══════════════════════════════════════════════════
 
 app.post('/api/deposit', auth, upload.single('screenshot'), async (req, res) => {
     try {
         const { amount } = req.body;
-        if (!amount || parseFloat(amount) <= 0) {
-            return res.status(400).json({ message: 'Invalid deposit amount' });
+        const depositAmount = parseFloat(amount);
+
+        // STRICT $1 validation
+        if (!depositAmount || depositAmount !== 1) {
+            return res.status(400).json({ message: 'Only $1 deposits are allowed' });
         }
         if (!req.file) {
             return res.status(400).json({ message: 'Payment screenshot required' });
         }
 
-        // Build file URL (adjust based on deployment)
+        // Check if user is eligible for queue
+        const user = await User.findById(req.userId);
+        if (user.queueStatus === 'expired') {
+            return res.status(403).json({ message: 'Your account has expired. Please contact admin for reactivation.' });
+        }
+
         const baseUrl = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
         const screenshotUrl = `${baseUrl}/uploads/${req.file.filename}`;
 
         const deposit = new Transaction({
             userId: req.userId,
             type: 'deposit',
-            amount: parseFloat(amount),
+            amount: 1,
             screenshot: screenshotUrl,
             status: 'pending',
-            description: `Deposit request for $${amount}`
+            description: 'Deposit request for $1'
         });
         await deposit.save();
         res.json({ message: 'Deposit submitted! Awaiting admin verification.' });
@@ -346,7 +342,6 @@ app.post('/api/withdraw', auth, pinVerify, async (req, res) => {
             return res.status(400).json({ message: 'Insufficient balance' });
         }
 
-        // Save account details
         if (accountDetails) {
             user.accountDetails = accountDetails;
             await user.save();
@@ -419,7 +414,6 @@ app.post('/api/withdraw/:id/cancel', auth, async (req, res) => {
 
         if (!transaction) return res.status(404).json({ message: 'Pending withdrawal not found' });
 
-        // Refund
         await User.findByIdAndUpdate(req.userId, {
             $inc: { 'wallet.balance': transaction.amount }
         });
@@ -436,31 +430,28 @@ app.post('/api/withdraw/:id/cancel', auth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
-// REINVEST ROUTE
+// QUEUE WITHDRAWAL (User at #1 claims their earning)
 // ═══════════════════════════════════════════════════
 
-app.post('/api/reinvest', auth, pinVerify, async (req, res) => {
+app.post('/api/queue/claim', auth, pinVerify, async (req, res) => {
     try {
-        const { amount } = req.body;
-        const numDollars = parseInt(amount);
+        // Find user's slot at position #1
+        const topSlot = await QueueSlot.findOne({
+            userId: req.userId,
+            status: 'active',
+            queueType: 'main',
+            position: 1
+        });
 
-        if (!numDollars || numDollars < 1) {
-            return res.status(400).json({ message: 'Minimum reinvestment is $1' });
+        if (!topSlot) {
+            return res.status(400).json({ message: 'You are not at the top of the queue' });
         }
 
-        // Record reinvest transaction
-        await new Transaction({
-            userId: req.userId,
-            type: 'reinvest',
-            amount: numDollars,
-            status: 'completed',
-            description: `Reinvested $${numDollars} from earnings`
-        }).save();
+        const result = await queueEngine.completeWithdrawal(topSlot._id, req.userId);
 
-        const result = await queueEngine.invest(req.userId, numDollars);
         res.json({
-            message: `$${numDollars} reinvested into queue`,
-            slots: result.slots,
+            message: `Queue completed! You earned $${result.earning}`,
+            earning: result.earning,
             wallet: result.wallet
         });
     } catch (err) {
@@ -474,10 +465,21 @@ app.post('/api/reinvest', auth, pinVerify, async (req, res) => {
 
 app.get('/api/transactions', auth, async (req, res) => {
     try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
+
         const transactions = await Transaction.find({ userId: req.userId })
             .sort({ createdAt: -1 })
-            .limit(50);
-        res.json(transactions);
+            .skip(skip)
+            .limit(limit);
+
+        const total = await Transaction.countDocuments({ userId: req.userId });
+
+        res.json({
+            transactions,
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+        });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch transactions' });
     }
@@ -492,26 +494,47 @@ app.get('/api/user/status', auth, async (req, res) => {
         const user = await User.findById(req.userId);
         const activeSlots = await QueueSlot.find({
             userId: req.userId,
-            status: 'queued'
+            status: 'active'
         }).sort({ position: 1 });
 
-        const maturedSlots = await QueueSlot.find({
+        const completedSlots = await QueueSlot.countDocuments({
             userId: req.userId,
-            status: 'matured'
+            status: 'completed'
         });
+
+        // Check if user is at #1 with active timer
+        const atTopOfQueue = activeSlots.some(s => s.position === 1 && s.queueType === 'main');
+        let withdrawalTimer = null;
+        if (atTopOfQueue) {
+            const topSlot = activeSlots.find(s => s.position === 1);
+            if (topSlot?.withdrawalDeadline) {
+                const remaining = Math.max(0, new Date(topSlot.withdrawalDeadline).getTime() - Date.now());
+                withdrawalTimer = {
+                    slotId: topSlot._id,
+                    deadline: topSlot.withdrawalDeadline,
+                    remainingMs: remaining,
+                    remainingHours: Math.floor(remaining / (1000 * 60 * 60)),
+                    remainingMinutes: Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60)),
+                };
+            }
+        }
 
         res.json({
             wallet: user.wallet,
             status: user.status,
             pinSet: user.pinSet,
             username: user.username,
+            queueStatus: user.queueStatus,
             activeSlots: activeSlots.map(s => ({
                 id: s._id,
                 position: s.position,
                 queueType: s.queueType,
-                waitlistNumber: s.waitlistNumber
+                waitlistNumber: s.waitlistNumber,
+                withdrawalDeadline: s.withdrawalDeadline,
             })),
-            maturedCount: maturedSlots.length,
+            maturedCount: completedSlots,
+            atTopOfQueue,
+            withdrawalTimer,
         });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch status' });
@@ -524,35 +547,68 @@ app.get('/api/user/status', auth, async (req, res) => {
 
 app.get('/api/admin/stats', adminAuth, async (req, res) => {
     try {
-        const totalUsers = await User.countDocuments({ status: { $ne: 'admin' } });
-        const activeUsers = await User.countDocuments({ status: 'active' });
-        const suspendedUsers = await User.countDocuments({ status: 'suspended' });
-        const mainQueueCount = await QueueSlot.countDocuments({ status: 'queued', queueType: 'main' });
-        const waitlistCount = await QueueSlot.countDocuments({ status: 'queued', queueType: 'waitlist' });
-
-        const deposits = await Transaction.aggregate([
-            { $match: { type: 'deposit', status: 'completed' } },
-            { $group: { _id: null, total: { $sum: '$amount' } } }
-        ]);
-        const withdrawals = await Transaction.aggregate([
-            { $match: { type: 'withdrawal', status: 'completed' } },
-            { $group: { _id: null, total: { $sum: '$amount' } } }
-        ]);
-        const pendingDeposits = await Transaction.countDocuments({ type: 'deposit', status: 'pending' });
-        const pendingWithdrawals = await Transaction.countDocuments({ type: 'withdrawal', status: 'pending' });
-
-        const userBalances = await User.aggregate([
+        // Single aggregation pipeline for efficiency
+        const [userStats] = await User.aggregate([
             { $match: { status: { $ne: 'admin' } } },
-            { $group: { _id: null, total: { $sum: '$wallet.balance' } } }
+            {
+                $group: {
+                    _id: null,
+                    totalUsers: { $sum: 1 },
+                    activeUsers: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+                    suspendedUsers: { $sum: { $cond: [{ $eq: ['$status', 'suspended'] }, 1, 0] } },
+                    expiredUsers: { $sum: { $cond: [{ $eq: ['$queueStatus', 'expired'] }, 1, 0] } },
+                    totalUserBalances: { $sum: '$wallet.balance' },
+                }
+            }
+        ]);
+
+        const [queueStats] = await QueueSlot.aggregate([
+            { $match: { status: { $in: ['active', 'waiting'] } } },
+            {
+                $group: {
+                    _id: '$status',
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        const mainQueueCount = (await QueueSlot.countDocuments({ status: 'active', queueType: 'main' }));
+        const waitlistCount = (await QueueSlot.countDocuments({ status: 'waiting', queueType: 'waitlist' }));
+
+        const [depositStats] = await Transaction.aggregate([
+            { $match: { type: 'deposit' } },
+            {
+                $group: {
+                    _id: null,
+                    totalCompleted: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$amount', 0] } },
+                    pendingCount: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+                }
+            }
+        ]);
+
+        const [withdrawalStats] = await Transaction.aggregate([
+            { $match: { type: 'withdrawal' } },
+            {
+                $group: {
+                    _id: null,
+                    totalCompleted: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$amount', 0] } },
+                    pendingCount: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+                }
+            }
         ]);
 
         res.json({
-            totalUsers, activeUsers, suspendedUsers,
-            mainQueueCount, waitlistCount,
-            totalDeposits: deposits[0]?.total || 0,
-            totalWithdrawals: withdrawals[0]?.total || 0,
-            pendingDeposits, pendingWithdrawals,
-            totalUserBalances: userBalances[0]?.total || 0
+            totalUsers: userStats?.totalUsers || 0,
+            activeUsers: userStats?.activeUsers || 0,
+            suspendedUsers: userStats?.suspendedUsers || 0,
+            expiredUsers: userStats?.expiredUsers || 0,
+            mainQueueCount,
+            waitlistCount,
+            totalDeposits: depositStats?.totalCompleted || 0,
+            totalWithdrawals: withdrawalStats?.totalCompleted || 0,
+            pendingDeposits: depositStats?.pendingCount || 0,
+            pendingWithdrawals: withdrawalStats?.pendingCount || 0,
+            totalUserBalances: userStats?.totalUserBalances || 0
         });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch stats', error: err.message });
@@ -561,17 +617,47 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
     try {
-        const users = await User.find({ status: { $ne: 'admin' } })
-            .select('-password -pin')
-            .sort({ createdAt: -1 })
-            .lean();
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
+        const search = req.query.search || '';
 
-        const usersWithSlots = await Promise.all(users.map(async user => {
-            const activeSlots = await QueueSlot.countDocuments({ userId: user._id, status: 'queued' });
-            return { ...user, activeSlots };
+        let query = { status: { $ne: 'admin' } };
+        if (search) {
+            query.$or = [
+                { username: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } }
+            ];
+        }
+
+        const [users, total] = await Promise.all([
+            User.find(query)
+                .select('-password -pin')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+            User.countDocuments(query)
+        ]);
+
+        // Batch fetch active slot counts with aggregation instead of N+1
+        const userIds = users.map(u => u._id);
+        const slotCounts = await QueueSlot.aggregate([
+            { $match: { userId: { $in: userIds }, status: { $in: ['active', 'waiting'] } } },
+            { $group: { _id: '$userId', count: { $sum: 1 } } }
+        ]);
+        const slotMap = {};
+        slotCounts.forEach(s => { slotMap[s._id.toString()] = s.count; });
+
+        const usersWithSlots = users.map(user => ({
+            ...user,
+            activeSlots: slotMap[user._id.toString()] || 0
         }));
 
-        res.json(usersWithSlots);
+        res.json({
+            users: usersWithSlots,
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+        });
     } catch (err) {
         res.status(500).json({ message: 'Failed to fetch users', error: err.message });
     }
@@ -579,43 +665,74 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
 
 app.get('/api/admin/deposits', adminAuth, async (req, res) => {
     try {
-        const deposits = await Transaction.find({ type: 'deposit' })
-            .populate('userId', 'username')
-            .sort({ createdAt: -1 });
-        res.json(deposits);
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
+        const status = req.query.status; // optional filter
+
+        let query = { type: 'deposit' };
+        if (status) query.status = status;
+
+        const [deposits, total] = await Promise.all([
+            Transaction.find(query)
+                .populate('userId', 'username')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit),
+            Transaction.countDocuments(query)
+        ]);
+
+        res.json({
+            deposits,
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
+// DEPOSIT VERIFY → AUTO QUEUE ASSIGNMENT
 app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
-    const session = await mongoose.startSession()
-    session.startTransaction()
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
     try {
-        const transaction = await Transaction.findById(req.params.id).session(session)
+        const transaction = await Transaction.findById(req.params.id).session(session);
         if (!transaction || transaction.status !== 'pending' || transaction.type !== 'deposit') {
-            await session.abortTransaction()
-            session.end()
-            return res.status(404).json({ message: 'Pending deposit not found' })
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(404).json({ message: 'Pending deposit not found' });
         }
 
-        transaction.status = 'completed'
-        await transaction.save()
+        transaction.status = 'completed';
+        await transaction.save();
 
+        // Credit user balance
         await User.findByIdAndUpdate(transaction.userId, {
             $inc: { 'wallet.balance': transaction.amount }
-        }).session(session)
+        }).session(session);
 
-        await session.commitTransaction()
-        session.end()
+        await session.commitTransaction();
+        session.endSession();
 
-        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId}`)
-        res.json({ message: 'Deposit verified and credited' })
+        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId}`);
+
+        // AUTO-ASSIGN to queue after approval
+        try {
+            await queueEngine.assignToQueue(transaction.userId, transaction._id);
+            // Deduct the $1 from balance into queue
+            await User.findByIdAndUpdate(transaction.userId, {
+                $inc: { 'wallet.balance': -1, 'wallet.activeInQueue': 1 }
+            });
+            res.json({ message: 'Deposit verified, credited, and user assigned to queue' });
+        } catch (queueErr) {
+            console.error('[QUEUE ASSIGN ERROR]', queueErr.message);
+            res.json({ message: `Deposit verified and credited. Queue assignment: ${queueErr.message}` });
+        }
     } catch (err) {
-        await session.abortTransaction()
-        session.end()
-        res.status(500).json({ error: err.message })
+        await session.abortTransaction();
+        session.endSession();
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -636,10 +753,23 @@ app.post('/api/admin/deposits/:id/reject', adminAuth, async (req, res) => {
 
 app.get('/api/admin/withdrawals', adminAuth, async (req, res) => {
     try {
-        const withdrawals = await Transaction.find({ type: 'withdrawal' })
-            .populate('userId', 'username')
-            .sort({ createdAt: -1 });
-        res.json(withdrawals);
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
+
+        const [withdrawals, total] = await Promise.all([
+            Transaction.find({ type: 'withdrawal' })
+                .populate('userId', 'username')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit),
+            Transaction.countDocuments({ type: 'withdrawal' })
+        ]);
+
+        res.json({
+            withdrawals,
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -668,7 +798,6 @@ app.post('/api/admin/withdrawals/:id/reject', adminAuth, async (req, res) => {
             return res.status(404).json({ message: 'Pending withdrawal not found' });
         }
 
-        // Refund the user
         await User.findByIdAndUpdate(transaction.userId, {
             $inc: { 'wallet.balance': transaction.amount }
         });
@@ -686,11 +815,13 @@ app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
         const userId = req.params.id;
         await User.findByIdAndUpdate(userId, { status: 'suspended' });
 
-        // Cancel active queue slots and refund
-        const activeSlots = await QueueSlot.find({ userId, status: 'queued' });
+        const activeSlots = await QueueSlot.find({ userId, status: { $in: ['active', 'waiting'] } });
         if (activeSlots.length > 0) {
             const refundAmount = activeSlots.reduce((sum, s) => sum + s.amount, 0);
-            await QueueSlot.updateMany({ userId, status: 'queued' }, { status: 'cancelled' });
+            await QueueSlot.updateMany(
+                { userId, status: { $in: ['active', 'waiting'] } },
+                { status: 'cancelled' }
+            );
             await User.findByIdAndUpdate(userId, {
                 $inc: { 'wallet.balance': refundAmount, 'wallet.activeInQueue': -refundAmount }
             });
@@ -705,7 +836,7 @@ app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
 
 app.post('/api/admin/users/:id/activate', adminAuth, async (req, res) => {
     try {
-        await User.findByIdAndUpdate(req.params.id, { status: 'active' });
+        await User.findByIdAndUpdate(req.params.id, { status: 'active', queueStatus: 'eligible' });
         res.json({ message: 'User activated' });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -728,25 +859,94 @@ app.post('/api/admin/users/:id/add-balance', adminAuth, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════
+// ADMIN QUEUE MANAGEMENT
+// ═══════════════════════════════════════════════════
+
 app.get('/api/admin/queue', adminAuth, async (req, res) => {
     try {
-        const mainQueue = await QueueSlot.find({ status: 'queued', queueType: 'main' })
+        const mainQueue = await QueueSlot.find({ status: 'active', queueType: 'main' })
             .sort({ position: 1 })
-            .populate('userId', 'username');
-        const waitlist = await QueueSlot.find({ status: 'queued', queueType: 'waitlist' })
+            .populate('userId', 'username email');
+        const waitlist = await QueueSlot.find({ status: 'waiting', queueType: 'waitlist' })
             .sort({ waitlistNumber: 1 })
-            .populate('userId', 'username');
+            .populate('userId', 'username email');
         const settings = await queueEngine.getSettings();
 
-        res.json({ mainQueue, waitlist, settings, timer: queueEngine.cycleTimer });
+        // Get expired slots (recent)
+        const expiredSlots = await QueueSlot.find({ status: 'expired' })
+            .sort({ expiredAt: -1 })
+            .limit(20)
+            .populate('userId', 'username email');
+
+        // Get timers for all active slots
+        const timers = mainQueue
+            .filter(s => s.withdrawalDeadline)
+            .map(s => ({
+                slotId: s._id,
+                userId: s.userId,
+                position: s.position,
+                deadline: s.withdrawalDeadline,
+                remainingMs: Math.max(0, new Date(s.withdrawalDeadline).getTime() - Date.now()),
+                isNearExpiry: (new Date(s.withdrawalDeadline).getTime() - Date.now()) < (2 * 60 * 60 * 1000), // < 2 hours
+            }));
+
+        res.json({
+            mainQueue,
+            waitlist,
+            expiredSlots,
+            settings,
+            timer: queueEngine.cycleTimer,
+            timers,
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
+// Admin: Manually assign user to queue
+app.post('/api/admin/queue/assign/:userId', adminAuth, async (req, res) => {
+    try {
+        const slot = await queueEngine.assignToQueue(req.params.userId, null);
+        // Deduct from balance
+        await User.findByIdAndUpdate(req.params.userId, {
+            $inc: { 'wallet.balance': -1, 'wallet.activeInQueue': 1 }
+        });
+        res.json({ message: 'User assigned to queue', slot });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// Admin: Extend timer
+app.post('/api/admin/queue/extend-timer/:slotId', adminAuth, async (req, res) => {
+    try {
+        const { hours } = req.body;
+        if (!hours || hours <= 0) return res.status(400).json({ message: 'Hours must be positive' });
+        const slot = await queueEngine.extendTimer(req.params.slotId, hours);
+        res.json({ message: `Timer extended by ${hours} hours`, slot });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// Admin: Reactivate expired user
+app.post('/api/admin/queue/reactivate/:userId', adminAuth, async (req, res) => {
+    try {
+        const user = await queueEngine.reactivateUser(req.params.userId);
+        res.json({ message: 'User reactivated and eligible for queue', user: { _id: user._id, username: user.username, queueStatus: user.queueStatus } });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// ADMIN SETTINGS
+// ═══════════════════════════════════════════════════
+
 app.post('/api/admin/settings', adminAuth, async (req, res) => {
     try {
-        const allowedFields = ['queueSize', 'waitlistStart', 'waitlistMax', 'maturityMultiplier', 'cycleTimerSeconds', 'autoPromote', 'minDeposit'];
+        const allowedFields = ['queueSize', 'waitlistStart', 'waitlistMax', 'maturityMultiplier', 'cycleTimerSeconds', 'cooldownSeconds', 'autoPromote', 'minDeposit', 'maxDeposit', 'withdrawalTimerHours', 'allowAutoReentry'];
         const updates = {};
         allowedFields.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
 
@@ -775,6 +975,58 @@ app.post('/api/admin/update-credentials', adminAuth, async (req, res) => {
         res.json({ message: 'Admin credentials updated' });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// LEGACY INVEST ROUTES (backward compat)
+// ═══════════════════════════════════════════════════
+
+app.post('/api/invest', auth, pinVerify, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const numDollars = parseInt(amount);
+
+        if (!numDollars || numDollars < 1) {
+            return res.status(400).json({ message: 'Minimum investment is $1' });
+        }
+
+        const result = await queueEngine.invest(req.userId, numDollars);
+        res.json({
+            message: `$${numDollars} invested into ${result.slots.length} queue slot(s)`,
+            slots: result.slots,
+            wallet: result.wallet
+        });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+app.post('/api/reinvest', auth, pinVerify, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const numDollars = parseInt(amount);
+
+        if (!numDollars || numDollars < 1) {
+            return res.status(400).json({ message: 'Minimum reinvestment is $1' });
+        }
+
+        await new Transaction({
+            userId: req.userId,
+            type: 'reinvest',
+            amount: numDollars,
+            status: 'completed',
+            description: `Reinvested $${numDollars} from earnings`
+        }).save();
+
+        const result = await queueEngine.invest(req.userId, numDollars);
+        res.json({
+            message: `$${numDollars} reinvested into queue`,
+            slots: result.slots,
+            wallet: result.wallet
+        });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
     }
 });
 
@@ -810,7 +1062,6 @@ const initAdmin = async () => {
         await admin.save();
         console.log('[INIT] Admin created: Admin / admin123');
     } else {
-        // Ensure status is 'admin' and email is set (fix if previously created as regular user or missing email)
         let needsSave = false;
         if (admin.status !== 'admin') {
             admin.status = 'admin';
@@ -844,4 +1095,4 @@ mongoose.connect(process.env.MONGODB_URI)
     .catch(err => console.error('[DB ERROR]', err));
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`[1 DOLLAR APP] Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`[1 DOLLAR APP v4.0] Server running on port ${PORT}`));
