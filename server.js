@@ -76,7 +76,10 @@ app.post('/api/auth/register', async (req, res) => {
                 wallet: user.wallet,
                 status: user.status,
                 pinSet: user.pinSet,
-                queueStatus: user.queueStatus
+                queueStatus: user.queueStatus,
+                hasDeposited: user.hasDeposited,
+                depositStatus: user.depositStatus,
+                lifecyclePhase: user.lifecyclePhase
             }
         });
     } catch (err) {
@@ -95,6 +98,9 @@ app.post('/api/auth/login', async (req, res) => {
         if (user.status === 'suspended') {
             return res.status(403).json({ message: 'Account has been suspended' });
         }
+        if (user.status === 'terminated') {
+            return res.status(403).json({ message: 'Account has been terminated. No further actions allowed.' });
+        }
 
         const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.json({
@@ -106,7 +112,10 @@ app.post('/api/auth/login', async (req, res) => {
                 wallet: user.wallet,
                 status: user.status,
                 pinSet: user.pinSet,
-                queueStatus: user.queueStatus
+                queueStatus: user.queueStatus,
+                hasDeposited: user.hasDeposited,
+                depositStatus: user.depositStatus,
+                lifecyclePhase: user.lifecyclePhase
             }
         });
     } catch (err) {
@@ -294,24 +303,44 @@ app.post('/api/deposit', auth, upload.single('screenshot'), async (req, res) => 
             return res.status(400).json({ message: 'Payment screenshot required' });
         }
 
-        // Check if user is eligible for queue
+        // ═══ ONE-TIME DEPOSIT CHECK ═══
         const user = await User.findById(req.userId);
+
+        // Block terminated accounts
+        if (user.status === 'terminated') {
+            return res.status(403).json({ message: 'Account terminated. No further actions allowed.' });
+        }
+        // Block if already deposited permanently
+        if (user.hasDeposited === true) {
+            return res.status(403).json({ message: 'Deposit already used. Wait for queue completion.' });
+        }
+        // Block if a pending deposit exists
+        if (user.depositStatus === 'pending') {
+            return res.status(403).json({ message: 'You already have a pending deposit awaiting approval.' });
+        }
+        // Block expired users
         if (user.queueStatus === 'expired') {
             return res.status(403).json({ message: 'Your account has expired. Please contact admin for reactivation.' });
         }
 
-        const baseUrl = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
-        const screenshotUrl = `${baseUrl}/uploads/${req.file.filename}`;
+        // ═══ IMAGE FIX: Store RELATIVE path ═══
+        const screenshotPath = `/uploads/${req.file.filename}`;
 
         const deposit = new Transaction({
             userId: req.userId,
             type: 'deposit',
             amount: 1,
-            screenshot: screenshotUrl,
+            screenshot: screenshotPath,
             status: 'pending',
             description: 'Deposit request for $1'
         });
         await deposit.save();
+
+        // Update user deposit status
+        user.depositStatus = 'pending';
+        user.lifecyclePhase = 'deposited';
+        await user.save();
+
         res.json({ message: 'Deposit submitted! Awaiting admin verification.' });
     } catch (err) {
         res.status(500).json({ message: 'Deposit failed', error: err.message });
@@ -329,6 +358,12 @@ app.post('/api/withdraw', auth, pinVerify, async (req, res) => {
 
         if (!withdrawAmount || withdrawAmount <= 0) {
             return res.status(400).json({ message: 'Invalid withdrawal amount' });
+        }
+
+        // Block terminated accounts
+        const userCheck = await User.findById(req.userId);
+        if (userCheck.status === 'terminated') {
+            return res.status(403).json({ message: 'Account terminated. No further actions allowed.' });
         }
 
         // Atomic deduction
@@ -370,6 +405,10 @@ app.post('/api/withdraw/all', auth, pinVerify, async (req, res) => {
 
         if (!user || user.wallet.balance <= 0) {
             return res.status(400).json({ message: 'No balance to withdraw' });
+        }
+        // Block terminated accounts
+        if (user.status === 'terminated') {
+            return res.status(403).json({ message: 'Account terminated. No further actions allowed.' });
         }
 
         const withdrawAmount = user.wallet.balance;
@@ -445,6 +484,12 @@ app.post('/api/queue/claim', auth, pinVerify, async (req, res) => {
 
         if (!topSlot) {
             return res.status(400).json({ message: 'You are not at the top of the queue' });
+        }
+
+        // Block terminated accounts
+        const userCheck = await User.findById(req.userId);
+        if (userCheck?.status === 'terminated') {
+            return res.status(403).json({ message: 'Account terminated. No further actions allowed.' });
         }
 
         const result = await queueEngine.completeWithdrawal(topSlot._id, req.userId);
@@ -707,15 +752,20 @@ app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
         transaction.status = 'completed';
         await transaction.save();
 
-        // Credit user balance
+        // Credit user balance + LOCK deposit permanently
         await User.findByIdAndUpdate(transaction.userId, {
-            $inc: { 'wallet.balance': transaction.amount }
+            $inc: { 'wallet.balance': transaction.amount },
+            $set: {
+                hasDeposited: true,
+                depositStatus: 'approved',
+                lifecyclePhase: 'in_queue'
+            }
         }).session(session);
 
         await session.commitTransaction();
         session.endSession();
 
-        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId}`);
+        console.log(`[ADMIN] Deposit $${transaction.amount} verified for user ${transaction.userId} | Deposit LOCKED`);
 
         // AUTO-ASSIGN to queue after approval
         try {
@@ -745,7 +795,16 @@ app.post('/api/admin/deposits/:id/reject', adminAuth, async (req, res) => {
 
         transaction.status = 'rejected';
         await transaction.save();
-        res.json({ message: 'Deposit rejected' });
+
+        // Reset user deposit status so they can try again
+        await User.findByIdAndUpdate(transaction.userId, {
+            $set: {
+                depositStatus: 'rejected',
+                lifecyclePhase: 'fresh'
+            }
+        });
+
+        res.json({ message: 'Deposit rejected. User can submit a new deposit.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -784,8 +843,27 @@ app.post('/api/admin/withdrawals/:id/pay', adminAuth, async (req, res) => {
 
         transaction.status = 'completed';
         await transaction.save();
-        console.log(`[ADMIN] Withdrawal $${transaction.amount} paid to user ${transaction.userId}`);
-        res.json({ message: 'Withdrawal marked as paid' });
+
+        // ═══ ACCOUNT LIFECYCLE: TERMINATE on withdrawal approval ═══
+        const user = await User.findById(transaction.userId);
+        if (user) {
+            // Remove from queue
+            await QueueSlot.updateMany(
+                { userId: user._id, status: { $in: ['active', 'waiting'] } },
+                { $set: { status: 'completed' } }
+            );
+
+            // Terminate account
+            user.status = 'terminated';
+            user.lifecyclePhase = 'completed';
+            user.terminatedAt = new Date();
+            user.wallet.activeInQueue = 0;
+            await user.save();
+
+            console.log(`[LIFECYCLE] User ${user.username} TERMINATED after withdrawal of $${transaction.amount}`);
+        }
+
+        res.json({ message: 'Withdrawal paid. User account terminated.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

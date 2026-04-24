@@ -12,6 +12,7 @@ const auth = async (req, res, next) => {
 
         if (!user) return res.status(401).json({ message: 'User not found' });
         if (user.status === 'suspended') return res.status(403).json({ message: 'Account suspended' });
+        if (user.status === 'terminated') return res.status(403).json({ message: 'Account terminated. No further actions allowed.' });
 
         req.user = user;
         req.userId = user._id;

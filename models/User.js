@@ -19,15 +19,32 @@ const userSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ['active', 'suspended', 'admin'],
-        default: 'active'
+        enum: ['active', 'suspended', 'terminated', 'admin'],
+        default: 'active',
+        index: true
     },
     queueStatus: {
         type: String,
         enum: ['eligible', 'in_queue', 'expired'],
         default: 'eligible',
         index: true
-    }
+    },
+    // ═══ ONE-TIME DEPOSIT SYSTEM ═══
+    hasDeposited: { type: Boolean, default: false, index: true },
+    depositStatus: {
+        type: String,
+        enum: ['none', 'pending', 'approved', 'rejected'],
+        default: 'none',
+        index: true
+    },
+    // ═══ LIFECYCLE TRACKING ═══
+    lifecyclePhase: {
+        type: String,
+        enum: ['fresh', 'deposited', 'in_queue', 'withdrawal_eligible', 'withdrawal_pending', 'completed'],
+        default: 'fresh',
+        index: true
+    },
+    terminatedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 // Hash password before save
