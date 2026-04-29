@@ -24,6 +24,7 @@ class QueueEngine {
             maturityMultiplier: 10,
             cycleTimerSeconds: 5,
             cooldownSeconds: 15,
+            depositAmount: 1.00,
             withdrawalTimerHours: 20,
             allowAutoReentry: false
         };
@@ -58,10 +59,11 @@ class QueueEngine {
         }
 
         const isMainQueue = activeCount < settings.queueSize;
+        const depositAmount = settings.depositAmount ?? 1.00;
 
         const slot = new QueueSlot({
             userId,
-            amount: 1,
+            amount: depositAmount,
             queueType: isMainQueue ? 'main' : 'waitlist',
             status: isMainQueue ? 'active' : 'waiting',
             depositTransactionId,
@@ -96,7 +98,7 @@ class QueueEngine {
         await new Transaction({
             userId,
             type: 'queue_entry',
-            amount: 1,
+            amount: depositAmount,
             status: 'completed',
             description: isMainQueue
                 ? `Assigned to queue position #${slot.position}`
@@ -487,12 +489,13 @@ class QueueEngine {
 
         const slots = [];
         let currentMainCount = mainCount;
+        const depositAmount = settings.depositAmount ?? 1.00;
 
         for (let i = 0; i < numDollars; i++) {
             const isMainQueue = currentMainCount < settings.queueSize;
             const slot = new QueueSlot({
                 userId,
-                amount: 1,
+                amount: depositAmount,
                 queueType: isMainQueue ? 'main' : 'waitlist',
                 status: isMainQueue ? 'active' : 'waiting',
             });

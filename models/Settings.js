@@ -8,8 +8,9 @@ const settingsSchema = new mongoose.Schema({
     cycleTimerSeconds: { type: Number, default: 5 },
     cooldownSeconds: { type: Number, default: 15 },
     autoPromote: { type: Boolean, default: true },
+    depositAmount: { type: Number, default: 1.00 }, // Dynamic deposit amount (float), admin-configurable
     minDeposit: { type: Number, default: 1 },
-    maxDeposit: { type: Number, default: 1 }, // Enforced $1 only
+    maxDeposit: { type: Number, default: 1 },
     withdrawalTimerHours: { type: Number, default: 20 }, // 20-hour countdown
     allowAutoReentry: { type: Boolean, default: false }, // Expired users cannot re-enter
 }, { timestamps: true });

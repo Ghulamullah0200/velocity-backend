@@ -287,17 +287,36 @@ app.post('/api/admin/bank-details', adminAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
-// DEPOSIT ROUTES (Strictly $1 only)
+// DEPOSIT SETTINGS (Public — no auth required)
+// ═══════════════════════════════════════════════════
+
+app.get('/api/deposit-settings', async (req, res) => {
+    try {
+        const settings = await Settings.findOne().lean();
+        res.json({
+            depositAmount: settings?.depositAmount ?? 1.00,
+            maturityMultiplier: settings?.maturityMultiplier ?? 10,
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch deposit settings' });
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// DEPOSIT ROUTES (Dynamic amount from admin settings)
 // ═══════════════════════════════════════════════════
 
 app.post('/api/deposit', auth, upload.single('screenshot'), async (req, res) => {
     try {
+        const settings = await Settings.findOne();
+        const requiredAmount = settings?.depositAmount ?? 1.00;
+
         const { amount } = req.body;
         const depositAmount = parseFloat(amount);
 
-        // STRICT $1 validation
-        if (!depositAmount || depositAmount !== 1) {
-            return res.status(400).json({ message: 'Only $1 deposits are allowed' });
+        // Validate against dynamic deposit amount (float comparison with tolerance)
+        if (!depositAmount || Math.abs(depositAmount - requiredAmount) > 0.001) {
+            return res.status(400).json({ message: `Only $${requiredAmount.toFixed(2)} deposits are allowed` });
         }
         if (!req.file) {
             return res.status(400).json({ message: 'Payment screenshot required' });
@@ -329,10 +348,10 @@ app.post('/api/deposit', auth, upload.single('screenshot'), async (req, res) => 
         const deposit = new Transaction({
             userId: req.userId,
             type: 'deposit',
-            amount: 1,
+            amount: requiredAmount,
             screenshot: screenshotPath,
             status: 'pending',
-            description: 'Deposit request for $1'
+            description: `Deposit request for $${requiredAmount.toFixed(2)}`
         });
         await deposit.save();
 
@@ -770,9 +789,9 @@ app.post('/api/admin/deposits/:id/verify', adminAuth, async (req, res) => {
         // AUTO-ASSIGN to queue after approval
         try {
             await queueEngine.assignToQueue(transaction.userId, transaction._id);
-            // Deduct the $1 from balance into queue
+            // Deduct the deposit amount from balance into queue
             await User.findByIdAndUpdate(transaction.userId, {
-                $inc: { 'wallet.balance': -1, 'wallet.activeInQueue': 1 }
+                $inc: { 'wallet.balance': -transaction.amount, 'wallet.activeInQueue': transaction.amount }
             });
             res.json({ message: 'Deposit verified, credited, and user assigned to queue' });
         } catch (queueErr) {
@@ -985,10 +1004,12 @@ app.get('/api/admin/queue', adminAuth, async (req, res) => {
 // Admin: Manually assign user to queue
 app.post('/api/admin/queue/assign/:userId', adminAuth, async (req, res) => {
     try {
+        const settings = await Settings.findOne();
+        const depositAmt = settings?.depositAmount ?? 1.00;
         const slot = await queueEngine.assignToQueue(req.params.userId, null);
-        // Deduct from balance
+        // Deduct from balance (dynamic amount)
         await User.findByIdAndUpdate(req.params.userId, {
-            $inc: { 'wallet.balance': -1, 'wallet.activeInQueue': 1 }
+            $inc: { 'wallet.balance': -depositAmt, 'wallet.activeInQueue': depositAmt }
         });
         res.json({ message: 'User assigned to queue', slot });
     } catch (err) {
@@ -1024,11 +1045,20 @@ app.post('/api/admin/queue/reactivate/:userId', adminAuth, async (req, res) => {
 
 app.post('/api/admin/settings', adminAuth, async (req, res) => {
     try {
-        const allowedFields = ['queueSize', 'waitlistStart', 'waitlistMax', 'maturityMultiplier', 'cycleTimerSeconds', 'cooldownSeconds', 'autoPromote', 'minDeposit', 'maxDeposit', 'withdrawalTimerHours', 'allowAutoReentry'];
+        const allowedFields = ['queueSize', 'waitlistStart', 'waitlistMax', 'maturityMultiplier', 'cycleTimerSeconds', 'cooldownSeconds', 'autoPromote', 'depositAmount', 'minDeposit', 'maxDeposit', 'withdrawalTimerHours', 'allowAutoReentry'];
         const updates = {};
         allowedFields.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
 
-        await Settings.findOneAndUpdate({}, updates, { upsert: true });
+        const updatedSettings = await Settings.findOneAndUpdate({}, updates, { upsert: true, new: true });
+
+        // Broadcast deposit amount change to all connected clients
+        if (updates.depositAmount !== undefined) {
+            io.emit('depositAmountUpdated', {
+                depositAmount: updatedSettings.depositAmount
+            });
+            console.log(`[ADMIN] Deposit amount updated to $${updatedSettings.depositAmount}`);
+        }
+
         res.json({ message: 'Settings updated' });
     } catch (err) {
         res.status(500).json({ error: err.message });
