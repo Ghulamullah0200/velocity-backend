@@ -1,24 +1,15 @@
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 
-// Ensure uploads directory exists
-const uploadDir = path.join(__dirname, '..', 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
+// ═══════════════════════════════════════════════════
+// USE MEMORY STORAGE instead of disk storage.
+// Railway has an ephemeral filesystem — files saved to
+// disk are lost on every deploy/restart.  By keeping
+// the buffer in memory we can convert it to a base64
+// data-URI and persist it directly in MongoDB.
+// ═══════════════════════════════════════════════════
 
-// Configure storage with UUID filenames
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        const ext = path.extname(file.originalname);
-        cb(null, 'deposit-' + uniqueSuffix + ext);
-    }
-});
+const storage = multer.memoryStorage();
 
 // File filter - only images
 const fileFilter = (req, file, cb) => {

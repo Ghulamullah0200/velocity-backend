@@ -342,14 +342,18 @@ app.post('/api/deposit', auth, upload.single('screenshot'), async (req, res) => 
             return res.status(403).json({ message: 'Your account has expired. Please contact admin for reactivation.' });
         }
 
-        // ═══ IMAGE FIX: Store RELATIVE path ═══
-        const screenshotPath = `/uploads/${req.file.filename}`;
+        // ═══ IMAGE FIX: Store as base64 data URI in MongoDB ═══
+        // Railway has an ephemeral filesystem — files on disk are lost on redeploy.
+        // Storing the image as a data URI ensures it persists in the database.
+        const base64Image = req.file.buffer.toString('base64');
+        const mimeType = req.file.mimetype; // e.g. 'image/jpeg'
+        const screenshotDataUri = `data:${mimeType};base64,${base64Image}`;
 
         const deposit = new Transaction({
             userId: req.userId,
             type: 'deposit',
             amount: requiredAmount,
-            screenshot: screenshotPath,
+            screenshot: screenshotDataUri,
             status: 'pending',
             description: `Deposit request for $${requiredAmount.toFixed(2)}`
         });
