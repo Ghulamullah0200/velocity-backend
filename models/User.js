@@ -45,6 +45,9 @@ const userSchema = new mongoose.Schema({
         index: true
     },
     terminatedAt: { type: Date, default: null },
+    // ═══ PUSH NOTIFICATIONS (FCM) ═══
+    fcmToken: { type: String, default: null, index: true },
+    lastActiveAt: { type: Date, default: null },
 }, { timestamps: true });
 
 // Hash password before save

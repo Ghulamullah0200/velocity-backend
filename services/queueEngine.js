@@ -2,6 +2,8 @@ const QueueSlot = require('../models/QueueSlot');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Settings = require('../models/Settings');
+const Notification = require('../models/Notification');
+const logger = require('../utils/logger');
 
 class QueueEngine {
     constructor(io) {
@@ -9,7 +11,6 @@ class QueueEngine {
         this.timerRunning = false;
         this.cycleTimer = 5;
         this.cooldownActive = false;
-        this.expiryCheckInterval = null;
     }
 
     // ═══════════════════════════════════════════════
@@ -50,7 +51,6 @@ class QueueEngine {
         const settings = await this.getSettings();
         const activeCount = await this.getActiveQueueCount();
 
-        // Check if user is eligible
         const user = await User.findById(userId);
         if (!user) throw new Error('User not found');
         if (user.status === 'suspended') throw new Error('Account is suspended');
@@ -72,15 +72,10 @@ class QueueEngine {
         if (isMainQueue) {
             slot.position = activeCount + 1;
 
-            // If this user lands at position 1 (empty queue), start their timer immediately
-            if (slot.position === 1) {
-                const deadline = new Date();
-                deadline.setHours(deadline.getHours() + settings.withdrawalTimerHours);
-                slot.withdrawalDeadline = deadline;
-                slot.timerStartedAt = new Date();
-            }
+            // ═══ FEATURE 2: NO automatic timer ═══
+            // Position #1 stays indefinitely until admin approves withdrawal
+            // Timer is NOT started automatically
         } else {
-            // Assign waitlist number
             const lastWaitlist = await QueueSlot.findOne({ queueType: 'waitlist', status: 'waiting' })
                 .sort({ waitlistNumber: -1 });
             slot.waitlistNumber = lastWaitlist
@@ -105,7 +100,21 @@ class QueueEngine {
                 : `Added to waitlist #${slot.waitlistNumber}`
         }).save();
 
-        console.log(`[QUEUE] User ${userId} → ${isMainQueue ? `Main #${slot.position}` : `Waitlist #${slot.waitlistNumber}`}`);
+        logger.info('QUEUE', `User ${userId} → ${isMainQueue ? `Main #${slot.position}` : `Waitlist #${slot.waitlistNumber}`}`);
+
+        // ═══ Auto-notification: User reaches top of queue ═══
+        if (isMainQueue && slot.position === 1) {
+            try {
+                await new Notification({
+                    title: 'You\'re #1 in Queue! 🎉',
+                    body: 'You are now at the top of the queue. Wait for admin to approve your withdrawal.',
+                    type: 'queue',
+                    targetUserId: userId,
+                }).save();
+            } catch (notifErr) {
+                logger.warn('NOTIFICATION', 'Failed to create queue top notification', notifErr.message);
+            }
+        }
 
         // Start cycle if queue is full
         const newCount = await this.getActiveQueueCount();
@@ -118,81 +127,18 @@ class QueueEngine {
     }
 
     // ═══════════════════════════════════════════════
-    // PROCESS CYCLE (FIFO maturation)
+    // PROCESS CYCLE
     // ═══════════════════════════════════════════════
+    // FEATURE 2 CHANGE: No automatic expiry. Cycle just processes queue state.
 
     async processCycle() {
-        const settings = await this.getSettings();
-
-        // Get position #1 slot (top of queue)
-        const topSlot = await QueueSlot.findOne({
-            status: 'active',
-            queueType: 'main',
-            position: 1
-        });
-
-        if (!topSlot) return;
-
-        // Check if timer has been started for this slot
-        if (!topSlot.withdrawalDeadline) {
-            // Start the 20-hour withdrawal timer
-            const deadline = new Date();
-            deadline.setHours(deadline.getHours() + settings.withdrawalTimerHours);
-            topSlot.withdrawalDeadline = deadline;
-            topSlot.timerStartedAt = new Date();
-            await topSlot.save();
-            console.log(`[TIMER] Started 20-hour countdown for slot ${topSlot._id} (user: ${topSlot.userId})`);
-            await this.broadcastState();
-            return; // Don't process — wait for withdrawal or expiry
-        }
-
-        // If deadline hasn't passed, skip (timer still running)
-        if (new Date() < topSlot.withdrawalDeadline) {
-            return;
-        }
-
-        // Deadline passed and user didn't withdraw — EXPIRE
-        await this.expireSlot(topSlot);
-    }
-
-    // ═══════════════════════════════════════════════
-    // EXPIRY HANDLING
-    // ═══════════════════════════════════════════════
-
-    async expireSlot(slot) {
-        slot.status = 'expired';
-        slot.expiredAt = new Date();
-        slot.position = 0;
-        await slot.save();
-
-        // Mark user as expired
-        await User.findByIdAndUpdate(slot.userId, {
-            queueStatus: 'expired',
-            $inc: { 'wallet.activeInQueue': -slot.amount }
-        });
-
-        console.log(`[EXPIRED] Slot ${slot._id} for user ${slot.userId} — timer exceeded`);
-
-        // Shift all positions down
-        await QueueSlot.updateMany(
-            { status: 'active', queueType: 'main', position: { $gt: 1 } },
-            { $inc: { position: -1 } }
-        );
-
-        // Auto-promote from waitlist
-        const settings = await this.getSettings();
-        if (settings.autoPromote) {
-            await this.promoteFromWaitlist();
-        }
-
-        // Start timer for new position #1 if exists
-        await this.startTimerForTopSlot();
-
+        // No automatic timer/expiry logic — admin controls withdrawal approval
+        // This cycle is kept for queue state management and broadcasting
         await this.broadcastState();
     }
 
     // ═══════════════════════════════════════════════
-    // WITHDRAWAL (User withdraws from top position)
+    // WITHDRAWAL (Admin approves → user gets paid)
     // ═══════════════════════════════════════════════
 
     async completeWithdrawal(slotId, userId) {
@@ -235,7 +181,7 @@ class QueueEngine {
             description: `Queue completed: $${slot.amount} → $${earning}`
         }).save();
 
-        console.log(`[COMPLETED] Slot ${slot._id}: $${slot.amount} → $${earning} for user ${slot.userId}`);
+        logger.info('COMPLETED', `Slot ${slot._id}: $${slot.amount} → $${earning} for user ${slot.userId}`);
 
         // Shift positions down
         await QueueSlot.updateMany(
@@ -248,8 +194,24 @@ class QueueEngine {
             await this.promoteFromWaitlist();
         }
 
-        // Start timer for new #1
-        await this.startTimerForTopSlot();
+        // ═══ Notify new #1 user ═══
+        const newTopSlot = await QueueSlot.findOne({
+            status: 'active',
+            queueType: 'main',
+            position: 1
+        });
+        if (newTopSlot) {
+            try {
+                await new Notification({
+                    title: 'You\'re #1 in Queue! 🎉',
+                    body: 'You are now at the top of the queue. Wait for admin to approve your withdrawal.',
+                    type: 'queue',
+                    targetUserId: newTopSlot.userId,
+                }).save();
+            } catch (notifErr) {
+                logger.warn('NOTIFICATION', 'Failed to create queue promotion notification');
+            }
+        }
 
         await this.broadcastState();
         return { earning, wallet: (await User.findById(slot.userId)).wallet };
@@ -278,10 +240,9 @@ class QueueEngine {
         nextWaitlist.waitlistNumber = null;
         await nextWaitlist.save();
 
-        // Update user status
         await User.findByIdAndUpdate(nextWaitlist.userId, { queueStatus: 'in_queue' });
 
-        console.log(`[PROMOTE] Waitlist → Main queue position #${activeCount + 1}`);
+        logger.info('PROMOTE', `Waitlist → Main queue position #${activeCount + 1}`);
 
         // Recursively fill more spots
         if (activeCount + 1 < settings.queueSize) {
@@ -290,43 +251,9 @@ class QueueEngine {
     }
 
     // ═══════════════════════════════════════════════
-    // TIMER MANAGEMENT
+    // ADMIN: Reactivate expired user
     // ═══════════════════════════════════════════════
 
-    async startTimerForTopSlot() {
-        const settings = await this.getSettings();
-        const topSlot = await QueueSlot.findOne({
-            status: 'active',
-            queueType: 'main',
-            position: 1
-        });
-
-        if (topSlot && !topSlot.withdrawalDeadline) {
-            const deadline = new Date();
-            deadline.setHours(deadline.getHours() + settings.withdrawalTimerHours);
-            topSlot.withdrawalDeadline = deadline;
-            topSlot.timerStartedAt = new Date();
-            await topSlot.save();
-            console.log(`[TIMER] Started countdown for new #1 slot ${topSlot._id}`);
-        }
-    }
-
-    // Admin: Extend timer
-    async extendTimer(slotId, additionalHours) {
-        const slot = await QueueSlot.findById(slotId);
-        if (!slot || slot.status !== 'active') throw new Error('Active slot not found');
-        if (!slot.withdrawalDeadline) throw new Error('Timer not started yet');
-
-        const newDeadline = new Date(slot.withdrawalDeadline.getTime() + (additionalHours * 60 * 60 * 1000));
-        slot.withdrawalDeadline = newDeadline;
-        await slot.save();
-
-        console.log(`[ADMIN] Timer extended by ${additionalHours}h for slot ${slotId}`);
-        await this.broadcastState();
-        return slot;
-    }
-
-    // Admin: Reactivate expired user
     async reactivateUser(userId) {
         const user = await User.findById(userId);
         if (!user) throw new Error('User not found');
@@ -335,24 +262,8 @@ class QueueEngine {
         user.queueStatus = 'eligible';
         await user.save();
 
-        console.log(`[ADMIN] Reactivated expired user ${userId}`);
+        logger.info('ADMIN', `Reactivated expired user ${userId}`);
         return user;
-    }
-
-    // ═══════════════════════════════════════════════
-    // EXPIRY CHECK (runs periodically)
-    // ═══════════════════════════════════════════════
-
-    async checkExpiredSlots() {
-        const expiredSlots = await QueueSlot.find({
-            status: 'active',
-            withdrawalDeadline: { $lte: new Date() },
-            position: 1
-        });
-
-        for (const slot of expiredSlots) {
-            await this.expireSlot(slot);
-        }
     }
 
     // ═══════════════════════════════════════════════
@@ -379,7 +290,6 @@ class QueueEngine {
                     const mainCount = await this.getActiveQueueCount();
                     const settings = await this.getSettings();
                     if (mainCount >= settings.queueSize) {
-                        // Cooldown before next cycle
                         this.cooldownActive = true;
                         this.io.emit('cooldownUpdate', { active: true, seconds: cooldownSeconds });
                         setTimeout(() => {
@@ -401,22 +311,16 @@ class QueueEngine {
         const settings = await this.getSettings();
         const mainCount = await this.getActiveQueueCount();
 
-        console.log(`[QUEUE] Active: ${mainCount}/${settings.queueSize} | Timer running: ${this.timerRunning}`);
+        logger.info('QUEUE', `Active: ${mainCount}/${settings.queueSize} | Timer running: ${this.timerRunning}`);
 
         // Start cycle if queue is full
         if (mainCount >= settings.queueSize && !this.timerRunning) {
             this.startCycle();
         }
 
-        // Start periodic expiry check (every 60 seconds)
-        if (this.expiryCheckInterval) clearInterval(this.expiryCheckInterval);
-        this.expiryCheckInterval = setInterval(() => this.checkExpiredSlots(), 60000);
-
-        // Run initial expiry check
-        await this.checkExpiredSlots();
-
-        // Ensure #1 position has timer started
-        await this.startTimerForTopSlot();
+        // ═══ FEATURE 2: No automatic expiry check interval ═══
+        // Timer-based expiry has been removed.
+        // Admin manually controls when users are removed from queue.
     }
 
     // ═══════════════════════════════════════════════
@@ -437,21 +341,6 @@ class QueueEngine {
 
             const settings = await this.getSettings();
 
-            // Include timer info for top slot
-            const topSlot = mainQueue.find(s => s.position === 1);
-            let withdrawalTimer = null;
-            if (topSlot && topSlot.withdrawalDeadline) {
-                const remaining = Math.max(0, new Date(topSlot.withdrawalDeadline).getTime() - Date.now());
-                withdrawalTimer = {
-                    slotId: topSlot._id,
-                    userId: topSlot.userId,
-                    deadline: topSlot.withdrawalDeadline,
-                    remainingMs: remaining,
-                    remainingHours: Math.floor(remaining / (1000 * 60 * 60)),
-                    remainingMinutes: Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60)),
-                };
-            }
-
             this.io.emit('queueUpdate', {
                 mainQueue,
                 waitlist,
@@ -459,10 +348,9 @@ class QueueEngine {
                 waitlistCount: waitlist.length,
                 queueSize: settings.queueSize,
                 timer: this.cycleTimer,
-                withdrawalTimer,
             });
         } catch (err) {
-            console.error('[BROADCAST ERROR]', err);
+            logger.error('BROADCAST', `Broadcast error: ${err.message}`);
         }
     }
 
@@ -502,12 +390,6 @@ class QueueEngine {
 
             if (isMainQueue) {
                 slot.position = currentMainCount + 1;
-                if (slot.position === 1) {
-                    const deadline = new Date();
-                    deadline.setHours(deadline.getHours() + settings.withdrawalTimerHours);
-                    slot.withdrawalDeadline = deadline;
-                    slot.timerStartedAt = new Date();
-                }
                 currentMainCount++;
             } else {
                 const lastWaitlist = await QueueSlot.findOne({ queueType: 'waitlist', status: 'waiting' })
