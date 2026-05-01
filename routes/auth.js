@@ -105,4 +105,37 @@ router.post('/pin/verify', auth, asyncHandler(async (req, res) => {
     res.json({ valid: isValid });
 }));
 
+// ═══════════════════════════════════════════════════
+// CHANGE PASSWORD
+// ═══════════════════════════════════════════════════
+router.post('/change-password', auth, asyncHandler(async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+        return res.status(400).json({ message: 'Current password and new password are required' });
+    }
+    if (newPassword.length < 6) {
+        return res.status(400).json({ message: 'New password must be at least 6 characters' });
+    }
+    if (currentPassword === newPassword) {
+        return res.status(400).json({ message: 'New password must be different from current password' });
+    }
+
+    const user = await User.findById(req.userId);
+    if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+    }
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+        return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    user.password = newPassword; // Will be hashed by pre-save hook
+    await user.save();
+
+    logger.info('AUTH', `Password changed for user: ${user.username}`);
+    res.json({ message: 'Password changed successfully' });
+}));
+
 module.exports = router;

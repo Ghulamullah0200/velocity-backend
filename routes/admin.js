@@ -27,11 +27,31 @@ router.get('/stats', adminAuth, asyncHandler(async (req, res) => {
                 suspendedUsers: { $sum: { $cond: [{ $eq: ['$status', 'suspended'] }, 1, 0] } },
                 terminatedUsers: { $sum: { $cond: [{ $eq: ['$status', 'terminated'] }, 1, 0] } },
                 expiredUsers: { $sum: { $cond: [{ $eq: ['$queueStatus', 'expired'] }, 1, 0] } },
-                totalUserBalances: { $sum: '$wallet.balance' },
+                // Only count active users' balances (exclude suspended/terminated)
+                activeUserBalances: {
+                    $sum: {
+                        $cond: [
+                            { $eq: ['$status', 'active'] },
+                            '$wallet.balance',
+                            0
+                        ]
+                    }
+                },
+                // Total active queue amounts (only active users)
+                activeQueueAmounts: {
+                    $sum: {
+                        $cond: [
+                            { $eq: ['$status', 'active'] },
+                            '$wallet.activeInQueue',
+                            0
+                        ]
+                    }
+                },
             }
         }
     ]);
 
+    // Only count active/waiting queue slots (not suspended/terminated user slots)
     const [mainQueueCount, waitlistCount] = await Promise.all([
         QueueSlot.countDocuments({ status: 'active', queueType: 'main' }),
         QueueSlot.countDocuments({ status: 'waiting', queueType: 'waitlist' }),
@@ -71,7 +91,9 @@ router.get('/stats', adminAuth, asyncHandler(async (req, res) => {
         totalWithdrawals: withdrawalStats?.totalCompleted || 0,
         pendingDeposits: depositStats?.pendingCount || 0,
         pendingWithdrawals: withdrawalStats?.pendingCount || 0,
-        totalUserBalances: userStats?.totalUserBalances || 0
+        // Use ACTIVE users' balances only (not suspended/terminated)
+        totalUserBalances: userStats?.activeUserBalances || 0,
+        activeQueueAmounts: userStats?.activeQueueAmounts || 0,
     });
 }));
 
@@ -290,16 +312,23 @@ router.post('/deposits/:id/verify', adminAuth, asyncHandler(async (req, res) => 
                 $inc: { 'wallet.balance': -transaction.amount, 'wallet.activeInQueue': transaction.amount }
             });
 
-            // ═══ Auto-notification: Deposit approved ═══
+            // ═══ Auto-notification: Deposit approved (DB + FCM Push) ═══
             try {
-                await new Notification({
-                    title: 'Deposit Approved ✅',
-                    body: `Your deposit of $${transaction.amount.toFixed(2)} has been approved and you've been assigned to the queue!`,
+                const depositNotifTitle = 'Deposit Approved ✅';
+                const depositNotifBody = `Your deposit of $${transaction.amount.toFixed(2)} has been approved and you've been assigned to the queue!`;
+                const notif = await new Notification({
+                    title: depositNotifTitle,
+                    body: depositNotifBody,
                     type: 'deposit',
                     targetUserId: transaction.userId,
                     metadata: { transactionId: transaction._id, amount: transaction.amount },
                     sentBy: req.userId,
                 }).save();
+                // Send FCM push to device notification bar
+                fcmService.sendToUser(transaction.userId, depositNotifTitle, depositNotifBody, {
+                    notificationId: notif._id.toString(),
+                    type: 'deposit'
+                }).catch(() => { });
             } catch (notifErr) {
                 logger.warn('NOTIFICATION', 'Failed to create deposit notification', notifErr.message);
             }
@@ -383,16 +412,23 @@ router.post('/withdrawals/:id/pay', adminAuth, asyncHandler(async (req, res) => 
 
         logger.info('LIFECYCLE', `User ${user.username} TERMINATED after withdrawal of $${transaction.amount}`);
 
-        // ═══ Auto-notification: Withdrawal approved ═══
+        // ═══ Auto-notification: Withdrawal approved (DB + FCM Push) ═══
         try {
-            await new Notification({
-                title: 'Withdrawal Approved 💰',
-                body: `Your withdrawal of $${transaction.amount} has been processed! Amount has been sent to your account.`,
+            const withdrawNotifTitle = 'Withdrawal Approved 💰';
+            const withdrawNotifBody = `Your withdrawal of $${transaction.amount} has been processed! Amount has been sent to your account.`;
+            const notif = await new Notification({
+                title: withdrawNotifTitle,
+                body: withdrawNotifBody,
                 type: 'withdrawal',
                 targetUserId: transaction.userId,
                 metadata: { transactionId: transaction._id, amount: transaction.amount },
                 sentBy: req.userId,
             }).save();
+            // Send FCM push to device notification bar
+            fcmService.sendToUser(transaction.userId, withdrawNotifTitle, withdrawNotifBody, {
+                notificationId: notif._id.toString(),
+                type: 'withdrawal'
+            }).catch(() => { });
         } catch (notifErr) {
             logger.warn('NOTIFICATION', 'Failed to create withdrawal notification', notifErr.message);
         }
