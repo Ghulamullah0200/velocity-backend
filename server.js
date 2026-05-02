@@ -126,6 +126,87 @@ app.get('/api/bank-details', async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════
+// PUBLIC TRANSACTIONS (Transparency — no auth required)
+// Shows completed deposits & withdrawals with masked usernames
+// ═══════════════════════════════════════════════════
+app.get('/api/transactions/public', async (req, res) => {
+    const Transaction = require('./models/Transaction');
+    const User = require('./models/User');
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 30;
+    const skip = (page - 1) * limit;
+    const typeFilter = req.query.type; // 'deposit', 'withdrawal', or empty for all
+
+    try {
+        let query = {
+            type: { $in: ['deposit', 'withdrawal'] },
+            status: { $in: ['completed', 'pending'] }
+        };
+
+        if (typeFilter === 'deposit' || typeFilter === 'withdrawal') {
+            query.type = typeFilter;
+        }
+
+        const [transactions, total] = await Promise.all([
+            Transaction.find(query)
+                .populate('userId', 'username')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+            Transaction.countDocuments(query)
+        ]);
+
+        // Mask usernames for privacy (e.g., "JohnDoe" → "Jo****oe")
+        const masked = transactions.map(txn => {
+            const username = txn.userId?.username || 'Unknown';
+            let maskedName = username;
+            if (username.length > 3) {
+                maskedName = username.slice(0, 2) + '*'.repeat(Math.min(username.length - 4, 4)) + username.slice(-2);
+            }
+            return {
+                _id: txn._id,
+                type: txn.type,
+                amount: txn.amount,
+                status: txn.status,
+                description: txn.description,
+                createdAt: txn.createdAt,
+                username: maskedName,
+            };
+        });
+
+        // Also get summary stats
+        const [depositStats, withdrawalStats] = await Promise.all([
+            Transaction.aggregate([
+                { $match: { type: 'deposit', status: 'completed' } },
+                { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
+            ]),
+            Transaction.aggregate([
+                { $match: { type: 'withdrawal', status: 'completed' } },
+                { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
+            ])
+        ]);
+
+        res.json({
+            transactions: masked,
+            pagination: {
+                page, limit, total,
+                pages: Math.ceil(total / limit),
+                hasNext: page < Math.ceil(total / limit),
+            },
+            stats: {
+                totalDeposits: depositStats[0]?.total || 0,
+                depositCount: depositStats[0]?.count || 0,
+                totalWithdrawals: withdrawalStats[0]?.total || 0,
+                withdrawalCount: withdrawalStats[0]?.count || 0,
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch transactions', error: err.message });
+    }
+});
+
 // Legacy transaction route (redirect to user module)
 app.get('/api/transactions', require('./middleware/auth').auth, async (req, res) => {
     const Transaction = require('./models/Transaction');

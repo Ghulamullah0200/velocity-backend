@@ -186,23 +186,4 @@ router.post('/account-details', auth, asyncHandler(async (req, res) => {
 
     res.json({ message: 'Account details updated', accountDetails: user.accountDetails });
 }));
-// ═══════════════════════════════════════════════════
-// MARK NOTIFICATIONS AS READ
-// ═══════════════════════════════════════════════════
-router.post('/notifications/read', auth, asyncHandler(async (req, res) => {
-    const { notificationIds } = req.body;
-
-    if (!notificationIds || !Array.isArray(notificationIds) || notificationIds.length === 0) {
-        return res.status(400).json({ message: 'notificationIds array required' });
-    }
-
-    // Add current user to readBy for all specified notifications
-    await Notification.updateMany(
-        { _id: { $in: notificationIds } },
-        { $addToSet: { readBy: req.userId } }
-    );
-
-    res.json({ message: `${notificationIds.length} notifications marked as read` });
-}));
-
 module.exports = router;
